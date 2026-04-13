@@ -1095,7 +1095,7 @@ impl<'a> TransactionRebase<'a> {
                         .transaction
                         .operation
                         .upsert_key_conflict(&other_transaction.operation)
-                        | self
+                        || self
                             .transaction
                             .operation
                             .modifies_same_metadata(&other_transaction.operation)
