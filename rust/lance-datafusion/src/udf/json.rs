@@ -393,8 +393,9 @@ fn extract_json_path_with_type(jsonb_bytes: &[u8], path: &str) -> Result<Option<
                 } else if raw.is_boolean().unwrap_or(false) {
                     JsonbType::Boolean
                 } else if raw.is_number().unwrap_or(false) {
-                    // Try to determine if it's an integer or float
-                    if raw.to_i64().is_ok() {
+                    let is_float_storage =
+                        matches!(raw.as_number(), Ok(Some(jsonb::Number::Float64(_))));
+                    if !is_float_storage && raw.is_i64().unwrap_or(false) {
                         JsonbType::Int64
                     } else {
                         JsonbType::Float64
@@ -1223,6 +1224,45 @@ mod tests {
         assert_eq!(int_array.value(1), 3);
         assert_eq!(int_array.value(2), 2);
         assert!(int_array.is_null(3));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_extract_with_type() -> Result<()> {
+        use arrow_array::StructArray;
+        use arrow_array::UInt8Array;
+
+        let cases: &[(&str, JsonbType)] = &[
+            (r#"{"v": 1}"#, JsonbType::Int64),
+            (r#"{"v": 0}"#, JsonbType::Int64),
+            (r#"{"v": -42}"#, JsonbType::Int64),
+            (r#"{"v": 9223372036854775807}"#, JsonbType::Int64), // i64::MAX
+            (r#"{"v": 9223372036854775808}"#, JsonbType::Float64), // i64::MAX + 1
+            (r#"{"v": 1.0}"#, JsonbType::Float64),
+            (r#"{"v": 2.7}"#, JsonbType::Float64),
+            (r#"{"v": 1.5}"#, JsonbType::Float64),
+            (r#"{"v": -1.5}"#, JsonbType::Float64),
+            (r#"{"v": 1e2}"#, JsonbType::Float64),
+        ];
+
+        for (json, expected) in cases {
+            let bytes = create_test_jsonb(json);
+            let mut binary_builder = LargeBinaryBuilder::new();
+            binary_builder.append_value(&bytes);
+            let jsonb_array: ArrayRef = Arc::new(binary_builder.finish());
+            let path_array: ArrayRef = Arc::new(StringArray::from(vec![Some("$.v")]));
+
+            let result = json_extract_with_type_impl(&[jsonb_array, path_array])?;
+            let struct_array = result.as_any().downcast_ref::<StructArray>().unwrap();
+            let type_tags = struct_array
+                .column_by_name("type_tag")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap();
+            assert_eq!(type_tags.value(0), expected.as_u8());
+        }
 
         Ok(())
     }
