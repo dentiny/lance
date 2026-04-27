@@ -1099,9 +1099,9 @@ dependencies = [
 
 [[package]]
 name = "blake3"
-version = "1.8.4"
+version = "1.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d2d5991425dfd0785aed03aedcf0b321d61975c9b5b3689c774a2610ae0b51e"
+checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
 dependencies = [
  "arrayref",
  "arrayvec",
@@ -2709,7 +2709,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -3710,7 +3710,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3779,7 +3779,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3800,7 +3800,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrayref",
  "paste",
@@ -3809,7 +3809,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3846,7 +3846,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3880,7 +3880,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3898,7 +3898,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3935,7 +3935,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3967,7 +3967,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -3981,7 +3981,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4050,7 +4050,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4094,7 +4094,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4110,7 +4110,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4123,7 +4123,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4168,7 +4168,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4207,7 +4207,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "jieba-rs",
  "lindera",
@@ -5413,7 +5413,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "6.0.0-beta.3"
+version = "6.0.0-beta.4"
 dependencies = [
  "arrow",
  "arrow-array",
