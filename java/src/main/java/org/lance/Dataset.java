@@ -854,13 +854,8 @@ public class Dataset implements Closeable {
    * @return the version id of the dataset
    */
   public long version() {
-    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
-      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeGetVersionId();
-    }
+    return getVersion().getId();
   }
-
-  private native long nativeGetVersionId();
 
   /**
    * Gets the currently checked out version of the dataset.
@@ -1088,6 +1083,44 @@ public class Dataset implements Closeable {
   private native void innerMergeIndexMetadata(
       String indexUUID, int indexType, Optional<Integer> batchReadHead);
 
+  /**
+   * Build physical vector index segments from previously-created fragment-level index outputs.
+   *
+   * @param segments segment metadata returned by {@link #createIndex(IndexOptions)} when
+   *     fragmentIds are provided
+   * @param indexType concrete index type for the staged segments
+   * @param targetSegmentBytes optional size target for merged physical segments
+   * @return built physical segment metadata
+   */
+  public List<Index> buildIndexSegments(
+      List<Index> segments, IndexType indexType, Optional<Long> targetSegmentBytes) {
+    Preconditions.checkNotNull(segments, "segments cannot be null");
+    Preconditions.checkArgument(!segments.isEmpty(), "segments cannot be empty");
+    Preconditions.checkNotNull(indexType, "indexType cannot be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeBuildIndexSegments(segments, indexType.getValue(), targetSegmentBytes);
+    }
+  }
+
+  /**
+   * Build physical vector index segments from previously-created fragment-level index outputs.
+   *
+   * @param segments segment metadata returned by {@link #createIndex(IndexOptions)} when
+   *     fragmentIds are provided
+   * @param targetSegmentBytes optional size target for merged physical segments
+   * @return built physical segment metadata
+   */
+  @Deprecated
+  public List<Index> buildIndexSegments(List<Index> segments, Optional<Long> targetSegmentBytes) {
+    throw new IllegalArgumentException(
+        "buildIndexSegments now requires an explicit index type; call "
+            + "buildIndexSegments(segments, indexType, targetSegmentBytes)");
+  }
+
+  private native List<Index> nativeBuildIndexSegments(
+      List<Index> segments, int indexType, Optional<Long> targetSegmentBytes);
+
   /** Merge one caller-defined group of existing uncommitted vector index segments. */
   public Index mergeExistingIndexSegments(List<Index> segments) {
     Preconditions.checkNotNull(segments, "segments cannot be null");
@@ -1313,11 +1346,7 @@ public class Dataset implements Closeable {
   /**
    * Get all indexes with full metadata.
    *
-   * <p>Each returned {@link Index} is a physical index segment from the manifest. Use {@link
-   * #describeIndices()} for the logical-index view.
-   *
-   * @return list of Index objects with complete segment metadata, including index type and fragment
-   *     coverage
+   * @return list of Index objects with complete metadata including index type and fragment coverage
    */
   public List<Index> getIndexes() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -1782,6 +1811,15 @@ public class Dataset implements Closeable {
       }
     }
 
+    public void replaceMetadata(String tag, Map<String, String> metadata) {
+      Preconditions.checkArgument(tag != null, "tag cannot be null");
+      Preconditions.checkArgument(metadata != null, "metadata cannot be null");
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeReplaceTagMetadata(tag, metadata);
+      }
+    }
+
     /**
      * List all tags of the dataset.
      *
@@ -1832,6 +1870,15 @@ public class Dataset implements Closeable {
       try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
         Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
         return nativeListBranches();
+      }
+    }
+
+    public void replaceMetadata(String branchName, Map<String, String> metadata) {
+      Preconditions.checkArgument(branchName != null, "branchName cannot be null");
+      Preconditions.checkArgument(metadata != null, "metadata cannot be null");
+      try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+        nativeReplaceBranchMetadata(branchName, metadata);
       }
     }
   }
@@ -1919,6 +1966,8 @@ public class Dataset implements Closeable {
 
   private native void nativeUpdateTag(String tag, Ref ref);
 
+  private native void nativeReplaceTagMetadata(String tag, Map<String, String> metadata);
+
   private native List<Tag> nativeListTags();
 
   private native long nativeGetVersionByTag(String tag);
@@ -1932,6 +1981,8 @@ public class Dataset implements Closeable {
   private native void nativeDeleteBranch(String branch);
 
   private native List<Branch> nativeListBranches();
+
+  private native void nativeReplaceBranchMetadata(String branch, Map<String, String> metadata);
 
   public Dataset shallowClone(String targetPath, Ref ref) {
     return shallowClone(targetPath, ref, null);

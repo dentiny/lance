@@ -182,7 +182,7 @@ pub struct FullSchemaMergeInsertExec {
     input: Arc<dyn ExecutionPlan>,
     dataset: Arc<Dataset>,
     params: MergeInsertParams,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     merge_stats: Arc<Mutex<Option<MergeStats>>>,
     transaction: Arc<Mutex<Option<Transaction>>>,
@@ -200,12 +200,12 @@ impl FullSchemaMergeInsertExec {
         params: MergeInsertParams,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(empty_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         // Check if ON columns match the schema's unenforced primary key
         let field_ids: Vec<i32> = params
@@ -792,7 +792,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -928,6 +928,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     .collect(),
                 update_mode: Some(RewriteRows),
                 inserted_rows_filter: inserted_rows_filter.clone(),
+                updated_fragment_offsets: None,
             };
 
             // Step 5: Create and store the transaction

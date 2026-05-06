@@ -353,7 +353,7 @@ impl ExecutionPlan for ReplayExec {
         }
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         self.input.properties()
     }
 }
@@ -390,6 +390,7 @@ impl IoMetrics {
     }
 }
 
+#[derive(Clone)]
 pub struct IndexMetrics {
     indices_loaded: Count,
     parts_loaded: Count,

@@ -28,8 +28,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{self, Ordering};
 
-use std::ffi::CString;
-
 use ::arrow::pyarrow::PyArrowType;
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
@@ -53,10 +51,13 @@ use file::{
 };
 use log::Level;
 use pyo3::exceptions::PyIOError;
+use pyo3::ffi::c_str;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
 use scanner::ScanStatistics;
 use session::Session;
+use std::ffi::CString;
+use std::ptr::NonNull;
 
 pub(crate) mod arrow;
 #[cfg(feature = "datagen")]
@@ -68,6 +69,7 @@ pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
 pub(crate) mod indices;
+pub(crate) mod mem_wal;
 pub(crate) mod namespace;
 pub(crate) mod reader;
 pub(crate) mod scanner;
@@ -282,6 +284,14 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<namespace::PyRestNamespace>()?;
     m.add_class::<namespace::PyRestAdapter>()?;
     m.add_class::<storage_options::PyStorageOptionsAccessor>()?;
+    // MemWAL classes
+    m.add_class::<mem_wal::PyMergedGeneration>()?;
+    m.add_class::<mem_wal::PyRegionSnapshot>()?;
+    m.add_class::<mem_wal::PyRegionWriter>()?;
+    m.add_class::<mem_wal::PyLsmScanner>()?;
+    m.add_class::<mem_wal::PyExecutionPlan>()?;
+    m.add_class::<mem_wal::PyLsmPointLookupPlanner>()?;
+    m.add_class::<mem_wal::PyLsmVectorSearchPlanner>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
@@ -368,7 +378,12 @@ fn manifest_needs_migration(dataset: &Bound<'_, PyAny>) -> PyResult<bool> {
     ))
 }
 
-#[pyclass(name = "FFILanceTableProvider", module = "lance", subclass)]
+#[pyclass(
+    name = "FFILanceTableProvider",
+    module = "lance",
+    subclass,
+    skip_from_py_object
+)]
 #[derive(Clone)]
 struct FFILanceTableProvider {
     dataset: Arc<::lance::Dataset>,
@@ -424,8 +439,11 @@ fn ffi_logical_codec_from_pycapsule(obj: Bound<PyAny>) -> PyResult<FFI_LogicalEx
         obj
     };
 
-    let capsule = capsule.downcast::<PyCapsule>()?;
-    let codec = unsafe { capsule.reference::<FFI_LogicalExtensionCodec>() };
+    let capsule = capsule.cast::<PyCapsule>()?;
+    let data: NonNull<FFI_LogicalExtensionCodec> = capsule
+        .pointer_checked(Some(c_str!("datafusion_logical_extension_codec")))?
+        .cast();
+    let codec = unsafe { data.as_ref() };
 
     Ok(codec.clone())
 }

@@ -38,7 +38,7 @@ pub struct VectorIndexExec {
     max_visible_batch_position: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     /// Whether to include _rowid column (row position) in output.
     with_row_id: bool,
@@ -108,18 +108,18 @@ impl VectorIndexExec {
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
-        fields.push(Field::new(DISTANCE_COLUMN, DataType::Float32, false));
+        fields.push(Field::new(DISTANCE_COLUMN, DataType::Float32, true));
         if with_row_id {
             fields.push(Field::new(lance_core::ROW_ID, DataType::UInt64, true));
         }
         let output_schema = Arc::new(Schema::new(fields));
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Ok(Self {
             batch_store,
@@ -504,7 +504,7 @@ impl ExecutionPlan for VectorIndexExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
