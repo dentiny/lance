@@ -8,8 +8,12 @@ use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
+use datafusion::sql::{
+    parser::Statement as DFStatement,
+    sqlparser::ast::{Expr, Ident, SelectItem, SetExpr, Statement},
+};
 use futures::TryStreamExt;
-use lance_core::datatypes::BlobHandling;
+use lance_core::{ROW_ADDR, ROW_ID, datatypes::BlobHandling};
 use lance_datafusion::udf::register_functions;
 use std::sync::Arc;
 
@@ -89,8 +93,71 @@ impl SqlQueryBuilder {
         }
         ctx.register_table(self.table_name, Arc::new(provider))?;
         register_functions(&ctx);
-        let df = ctx.sql(&self.sql).await?;
+        let state = ctx.state();
+        let dialect = state.config_options().sql_parser.dialect;
+        let statement = state.sql_to_statement(&self.sql, &dialect)?;
+        let mut projected = statement.clone();
+        let columns = [(self.with_row_id, ROW_ID), (self.with_row_addr, ROW_ADDR)];
+        let plan = if project_system_columns(&mut projected, &columns) {
+            match state.statement_to_plan(projected).await {
+                Ok(plan) => plan,
+                Err(_) => state.statement_to_plan(statement).await?,
+            }
+        } else {
+            state.statement_to_plan(statement).await?
+        };
+        let df = ctx.execute_logical_plan(plan).await?;
         Ok(SqlQuery::new(df))
+    }
+}
+
+fn project_system_columns(statement: &mut DFStatement, columns: &[(bool, &str)]) -> bool {
+    let DFStatement::Statement(statement) = statement else {
+        return false;
+    };
+    let Statement::Query(query) = statement.as_mut() else {
+        return false;
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return false;
+    };
+    if select.distinct.is_some() {
+        return false;
+    }
+
+    let mut changed = false;
+    for &(enabled, name) in columns {
+        if enabled
+            && !select
+                .projection
+                .iter()
+                .any(|item| projects_column(item, name))
+        {
+            select
+                .projection
+                .push(SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(name))));
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn projects_column(item: &SelectItem, name: &str) -> bool {
+    match item {
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => true,
+        SelectItem::UnnamedExpr(Expr::Identifier(ident)) => ident_matches(ident, name),
+        SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) => idents
+            .last()
+            .is_some_and(|ident| ident_matches(ident, name)),
+        _ => false,
+    }
+}
+
+fn ident_matches(ident: &Ident, name: &str) -> bool {
+    if ident.quote_style.is_some() {
+        ident.value == name
+    } else {
+        ident.value.eq_ignore_ascii_case(name)
     }
 }
 
@@ -146,8 +213,8 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field};
-    use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
+    use lance_arrow::{ARROW_EXT_NAME_KEY, SchemaExt};
     use lance_core::datatypes::BlobHandling;
     use lance_datagen::{array, gen_batch};
     use lance_file::version::LanceFileVersion;
@@ -199,6 +266,77 @@ mod tests {
         pretty_assertions::assert_eq!(results.num_columns(), 4);
         assert_true!(results.column(2).as_primitive::<UInt64Type>().value(0) > 100);
         assert_true!(results.column(3).as_primitive::<UInt64Type>().value(0) > 100);
+    }
+
+    #[tokio::test]
+    async fn test_sql_includes_unprojected_system_columns() {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://test_sql_implicit_system_columns",
+                FragmentCount::from(1),
+                FragmentRowCount::from(2),
+            )
+            .await
+            .unwrap();
+
+        let batches = ds
+            .sql("SELECT x FROM dataset")
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        let batch = &batches[0];
+        assert_eq!(batch.schema().fields().len(), 3);
+        let row_id_index = batch.schema().index_of("_rowid").unwrap();
+        let row_ids = batch.column(row_id_index).as_primitive::<UInt64Type>();
+        assert_eq!(row_ids.values(), &[0, 1]);
+        let row_addr_index = batch.schema().index_of("_rowaddr").unwrap();
+        let row_addrs = batch.column(row_addr_index).as_primitive::<UInt64Type>();
+        assert_eq!(row_addrs.values(), &[0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_sql_wildcard_includes_system_columns_once() {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://test_sql_wildcard_system_columns",
+                FragmentCount::from(1),
+                FragmentRowCount::from(2),
+            )
+            .await
+            .unwrap();
+
+        let batches = ds
+            .sql("SELECT * FROM dataset")
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        let batch = &batches[0];
+        assert_eq!(
+            batch.schema().field_names(),
+            vec!["x", "_rowid", "_rowaddr"]
+        );
+        assert_eq!(
+            batch["_rowid"].as_primitive::<UInt64Type>().values(),
+            &[0, 1]
+        );
+        assert_eq!(
+            batch["_rowaddr"].as_primitive::<UInt64Type>().values(),
+            &[0, 1]
+        );
     }
 
     #[tokio::test]
