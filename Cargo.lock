@@ -4929,6 +4929,7 @@ dependencies = [
  "opendal",
  "path_abs",
  "pin-project",
+ "proptest",
  "prost",
  "rand 0.9.5",
  "reqsign-core",

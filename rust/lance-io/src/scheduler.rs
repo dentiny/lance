@@ -1170,11 +1170,7 @@ pub struct FileScheduler {
 
 fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
     // Note that range1.end <= range2.start is possible (e.g. when decoding string arrays)
-    range2.start <= (range1.end + block_size)
-}
-
-fn is_overlapping(range1: &Range<u64>, range2: &Range<u64>) -> bool {
-    range1.start < range2.end && range2.start < range1.end
+    range2.start <= range1.end.saturating_add(block_size)
 }
 
 impl FileScheduler {
@@ -1198,12 +1194,22 @@ impl FileScheduler {
         // The final priority is a combination of the row offset and the file number
         let priority = ((self.base_priority as u128) << 64) + priority as u128;
 
-        let mut merged_requests = Vec::with_capacity(request.len());
+        let reversed_range = request
+            .iter()
+            .find(|range| range.start > range.end)
+            .cloned();
+        let mut sorted_requests = request
+            .iter()
+            .filter(|range| range.start < range.end)
+            .cloned()
+            .collect::<Vec<_>>();
+        sorted_requests.sort_unstable_by_key(|range| (range.start, range.end));
 
-        if !request.is_empty() {
-            let mut curr_interval = request[0].clone();
+        let mut merged_requests = Vec::with_capacity(sorted_requests.len());
+        if let Some(first_range) = sorted_requests.first() {
+            let mut curr_interval = first_range.clone();
 
-            for req in request.iter().skip(1) {
+            for req in sorted_requests.iter().skip(1) {
                 if is_close_together(&curr_interval, req, self.block_size) {
                     curr_interval.end = curr_interval.end.max(req.end);
                 } else {
@@ -1217,22 +1223,22 @@ impl FileScheduler {
 
         let mut updated_requests = Vec::with_capacity(merged_requests.len());
         for req in merged_requests {
-            if req.is_empty() {
-                updated_requests.push(req);
-            } else {
-                let num_requests = (req.end - req.start).div_ceil(self.max_iop_size);
-                let bytes_per_request = (req.end - req.start) / num_requests;
-                for i in 0..num_requests {
-                    let start = req.start + i * bytes_per_request;
-                    let end = if i == num_requests - 1 {
-                        // Last request is a bit bigger due to rounding
-                        req.end
-                    } else {
-                        start + bytes_per_request
-                    };
-                    updated_requests.push(start..end);
-                }
+            let num_requests = (req.end - req.start).div_ceil(self.max_iop_size);
+            let bytes_per_request = (req.end - req.start) / num_requests;
+            for i in 0..num_requests {
+                let start = req.start + i * bytes_per_request;
+                let end = if i == num_requests - 1 {
+                    // Last request is a bit bigger due to rounding
+                    req.end
+                } else {
+                    start + bytes_per_request
+                };
+                updated_requests.push(start..end);
             }
+        }
+
+        if reversed_range.is_some() {
+            updated_requests.clear();
         }
 
         self.root.stats.record_request(&updated_requests);
@@ -1240,58 +1246,86 @@ impl FileScheduler {
             extra_stats.record_request(&updated_requests);
         }
 
-        let bytes_vec_fut = self.root.submit_request(
-            self.reader.clone(),
-            updated_requests.clone(),
-            priority,
-            self.bypass_backpressure,
+        let immediate_result = reversed_range.map_or_else(
+            || updated_requests.is_empty().then(|| Ok(Vec::new())),
+            |range| {
+                Some(Err(Error::invalid_input(format!(
+                    "I/O range start {} is greater than end {}",
+                    range.start, range.end
+                ))))
+            },
         );
-
-        let mut updated_index = 0;
-        let mut final_bytes = Vec::with_capacity(request.len());
+        let bytes_vec_fut = if let Some(result) = immediate_result {
+            futures::future::Either::Left(futures::future::ready(result))
+        } else {
+            futures::future::Either::Right(self.root.submit_request(
+                self.reader.clone(),
+                updated_requests.clone(),
+                priority,
+                self.bypass_backpressure,
+            ))
+        };
 
         async move {
             let bytes_vec = bytes_vec_fut.await?;
-
-            let mut orig_index = 0;
-            while (updated_index < updated_requests.len()) && (orig_index < request.len()) {
-                let updated_range = &updated_requests[updated_index];
-                let orig_range = &request[orig_index];
-                let byte_offset = updated_range.start as usize;
-
-                if is_overlapping(updated_range, orig_range) {
-                    // We need to undo the coalescing and splitting done earlier
-                    let start = orig_range.start as usize - byte_offset;
-                    if orig_range.end <= updated_range.end {
-                        // The original range is fully contained in the updated range, can do
-                        // zero-copy slice
-                        let end = orig_range.end as usize - byte_offset;
-                        final_bytes.push(bytes_vec[updated_index].slice(start..end));
-                    } else {
-                        // The original read was split into multiple requests, need to copy
-                        // back into a single buffer
-                        let orig_size = orig_range.end - orig_range.start;
-                        let mut merged_bytes = Vec::with_capacity(orig_size as usize);
-                        merged_bytes.extend_from_slice(&bytes_vec[updated_index].slice(start..));
-                        let mut copy_offset = merged_bytes.len() as u64;
-                        while copy_offset < orig_size {
-                            updated_index += 1;
-                            let next_range = &updated_requests[updated_index];
-                            let bytes_to_take =
-                                (orig_size - copy_offset).min(next_range.end - next_range.start);
-                            merged_bytes.extend_from_slice(
-                                &bytes_vec[updated_index].slice(0..bytes_to_take as usize),
-                            );
-                            copy_offset += bytes_to_take;
-                        }
-                        final_bytes.push(Bytes::from(merged_bytes));
-                    }
-                    orig_index += 1;
-                } else {
-                    updated_index += 1;
-                }
+            if bytes_vec.len() != updated_requests.len() {
+                return Err(Error::internal(format!(
+                    "I/O scheduler returned {} buffers for {} physical ranges",
+                    bytes_vec.len(),
+                    updated_requests.len()
+                )));
             }
 
+            let mut final_bytes = Vec::with_capacity(request.len());
+            for requested_range in request {
+                if requested_range.is_empty() {
+                    final_bytes.push(Bytes::new());
+                    continue;
+                }
+
+                let mut updated_index = updated_requests
+                    .partition_point(|updated_range| updated_range.end <= requested_range.start);
+                let Some(first_updated_range) = updated_requests.get(updated_index) else {
+                    return Err(Error::internal(format!(
+                        "no physical I/O range covers requested range {requested_range:?}"
+                    )));
+                };
+                if first_updated_range.start > requested_range.start {
+                    return Err(Error::internal(format!(
+                        "physical I/O range {first_updated_range:?} does not cover the start of requested range {requested_range:?}"
+                    )));
+                }
+
+                if requested_range.end <= first_updated_range.end {
+                    let start = (requested_range.start - first_updated_range.start) as usize;
+                    let end = (requested_range.end - first_updated_range.start) as usize;
+                    final_bytes.push(bytes_vec[updated_index].slice(start..end));
+                    continue;
+                }
+
+                let mut merged_bytes =
+                    Vec::with_capacity((requested_range.end - requested_range.start) as usize);
+                let mut cursor = requested_range.start;
+                while cursor < requested_range.end {
+                    let Some(updated_range) = updated_requests.get(updated_index) else {
+                        return Err(Error::internal(format!(
+                            "physical I/O ranges end at {cursor} before requested range {requested_range:?}"
+                        )));
+                    };
+                    if updated_range.start > cursor || updated_range.end <= cursor {
+                        return Err(Error::internal(format!(
+                            "physical I/O range {updated_range:?} does not cover offset {cursor} in requested range {requested_range:?}"
+                        )));
+                    }
+                    let copy_end = requested_range.end.min(updated_range.end);
+                    let start = (cursor - updated_range.start) as usize;
+                    let end = (copy_end - updated_range.start) as usize;
+                    merged_bytes.extend_from_slice(&bytes_vec[updated_index][start..end]);
+                    cursor = copy_end;
+                    updated_index += 1;
+                }
+                final_bytes.push(Bytes::from(merged_bytes));
+            }
             Ok(final_bytes)
         }
     }
@@ -1366,6 +1400,7 @@ mod tests {
 
     use futures::poll;
     use lance_core::utils::tempfile::TempObjFile;
+    use proptest::prelude::*;
     use rand::RngCore;
     use rstest::rstest;
 
@@ -1379,6 +1414,156 @@ mod tests {
     };
 
     use super::*;
+
+    const PROPERTY_DATA_LEN: usize = 128;
+
+    #[derive(Debug)]
+    struct PropertyReader {
+        data: Bytes,
+        path: Path,
+    }
+
+    impl lance_core::deepsize::DeepSizeOf for PropertyReader {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+            self.data.len()
+        }
+    }
+
+    impl Reader for PropertyReader {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn block_size(&self) -> usize {
+            4096
+        }
+
+        fn io_parallelism(&self) -> usize {
+            1
+        }
+
+        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+            Box::pin(async move { Ok(self.data.len()) })
+        }
+
+        fn get_range(
+            &self,
+            range: Range<usize>,
+        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+            let bytes = self.data.slice(range);
+            Box::pin(async move { Ok(bytes) })
+        }
+
+        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+            let bytes = self.data.clone();
+            Box::pin(async move { Ok(bytes) })
+        }
+    }
+
+    fn io_ranges() -> impl Strategy<Value = Vec<Range<u64>>> {
+        proptest::collection::vec(
+            (
+                0_u64..=PROPERTY_DATA_LEN as u64,
+                0_u64..=PROPERTY_DATA_LEN as u64,
+            )
+                .prop_map(|(start, end)| start..end),
+            0..20,
+        )
+    }
+
+    fn non_empty_io_ranges() -> impl Strategy<Value = Vec<Range<u64>>> {
+        proptest::collection::vec(
+            (
+                0_u64..PROPERTY_DATA_LEN as u64,
+                1_u64..=PROPERTY_DATA_LEN as u64,
+            )
+                .prop_filter_map("range must be non-empty", |(first, second)| {
+                    (first != second).then(|| first.min(second)..first.max(second))
+                }),
+            0..20,
+        )
+    }
+
+    fn assert_reads_match_source(
+        ranges: Vec<Range<u64>>,
+        block_size: u64,
+        max_iop_size: u64,
+    ) -> std::result::Result<(), TestCaseError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move {
+            let source = Bytes::from(
+                (0..PROPERTY_DATA_LEN)
+                    .map(|offset| u8::try_from(offset).expect("property offset fits in u8"))
+                    .collect::<Vec<_>>(),
+            );
+            let reader: Arc<dyn Reader> = Arc::new(PropertyReader {
+                data: source.clone(),
+                path: Path::parse("property-data").expect("property path is valid"),
+            });
+            let scheduler = ScanScheduler::new(
+                Arc::new(ObjectStore::memory()),
+                SchedulerConfig::default_for_testing().with_lite_scheduler(),
+            );
+            let mut file_scheduler = scheduler.open_reader(reader);
+            file_scheduler.block_size = block_size;
+            file_scheduler.max_iop_size = max_iop_size;
+
+            let actual = file_scheduler.submit_request(ranges.clone(), 0).await;
+            if let Some(reversed_range) = ranges.iter().find(|range| range.start > range.end) {
+                let error = actual.expect_err("a reversed range should be rejected");
+                let is_invalid_input = matches!(error, Error::InvalidInput { .. });
+                prop_assert!(is_invalid_input);
+                let expected_message = format!(
+                    "I/O range start {} is greater than end {}",
+                    reversed_range.start, reversed_range.end
+                );
+                let has_expected_message = error.to_string().contains(&expected_message);
+                prop_assert!(has_expected_message);
+                return Ok(());
+            }
+            let actual = actual.map_err(|error| TestCaseError::fail(error.to_string()))?;
+            let expected = ranges
+                .iter()
+                .map(|range| source.slice(range.start as usize..range.end as usize))
+                .collect::<Vec<_>>();
+            prop_assert_eq!(actual, expected);
+            Ok(())
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn arbitrary_io_ranges_match_direct_reads(
+            ranges in io_ranges(),
+            block_size in 0_u64..16,
+            max_iop_size in 1_u64..32,
+        ) {
+            assert_reads_match_source(ranges, block_size, max_iop_size)?;
+        }
+
+        #[test]
+        fn unordered_non_empty_io_ranges_match_direct_reads(
+            ranges in non_empty_io_ranges(),
+            block_size in 0_u64..16,
+            max_iop_size in 1_u64..32,
+        ) {
+            assert_reads_match_source(ranges, block_size, max_iop_size)?;
+        }
+    }
+
+    #[test]
+    fn close_together_handles_offsets_near_u64_max() {
+        assert!(is_close_together(
+            &(u64::MAX - 2..u64::MAX - 1),
+            &(u64::MAX - 1..u64::MAX),
+            4096,
+        ));
+    }
 
     fn make_task(priority: u128, bypass_backpressure: bool) -> IoTask {
         IoTask {
