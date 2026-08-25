@@ -180,11 +180,56 @@ Choose the read API based on the payload shape you want:
 | `read_blobs` | `List[Tuple[int, Optional[bytes]]]` | You need complete blob payloads in memory, such as training loaders or batch preprocessing. |
 | `read_blob_ranges` | `List[Tuple[int, int, Optional[bytes]]]` | You need selected byte ranges from multiple rows without materializing complete blobs. |
 | `take_blobs` | `List[Optional[BlobFile]]` | You need file-like objects for streaming, seeking, or partial reads. |
+| `open_blobs` | `List[Optional[BlobFile]]` | You already scanned nested Blob v2 descriptors and want lazy handles for selected leaves. |
 | `scanner(..., blob_handling="all_binary")` | Arrow binary columns | You want blob columns in a scan result or `pyarrow.Table`. |
 
 Do not wrap `take_blobs` in your own thread pool just to call `read()` or
 `readall()` on every blob. Use `read_blobs` instead; it plans and executes
 batched blob reads through Lance's scheduler.
+
+### Open selected blobs inside nested values
+
+Descriptor scans preserve arbitrary struct and variable-length list nesting
+without reading blob payloads. Use normal Arrow indexing to select the leaf
+descriptors you need, then pass each descriptor and its physical row address to
+`open_blobs`.
+
+For example, given this schema:
+
+```text
+mystruct: struct<
+  x: int32,
+  y: list<list<blob>>
+>
+```
+
+the following opens `mystruct.y[0][1]` and `mystruct.y[4][5]` from one row:
+
+```python
+table = ds.to_table(columns=["mystruct"], with_row_address=True)
+row = 0
+row_address = table["_rowaddr"][row].as_py()
+y = table["mystruct"][row]["y"]
+
+first, second = ds.open_blobs(
+    "mystruct.y",
+    [y[0][1].as_py(), y[4][5].as_py()],
+    [row_address, row_address],
+)
+
+# Creating the handles does not read payload bytes.
+header = first.read(64 * 1024)
+```
+
+The field path names struct fields and treats list levels as transparent.
+Repeat a row address when selecting multiple leaves from the same row; selections
+from different rows use their respective addresses. Null descriptors produce
+`None`.
+
+!!! warning
+    Blob descriptors and physical row addresses are snapshot-bound. Use them
+    only with the dataset version from which they were scanned; compaction or
+    column rewrites can move the payload and produce new descriptors.
 
 Exactly one selector must be provided to `read_blobs` or `take_blobs`: `ids`,
 `indices`, or `addresses`. `read_blob_ranges` accepts the same selector kinds

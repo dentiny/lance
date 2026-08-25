@@ -4,7 +4,7 @@
 //! Lance Dataset
 //!
 
-use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_array::{RecordBatch, RecordBatchReader, StructArray};
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{Duration, prelude::*};
 use futures::future::BoxFuture;
@@ -1823,6 +1823,44 @@ impl Dataset {
         column: impl AsRef<str>,
     ) -> Result<Vec<Option<BlobFile>>> {
         blob::take_blobs_by_addresses(self, row_addrs, column.as_ref()).await
+    }
+
+    /// Open lazy [`BlobFile`] handles from Blob v2 descriptors.
+    ///
+    /// Descriptor scans preserve arbitrary struct and list nesting. Callers can
+    /// select the descriptor leaves they need with Arrow operations, then pass
+    /// them here with the physical row address of each leaf. List levels are
+    /// transparent in `column`, so `info.groups.blobs` can identify a blob leaf
+    /// below any number of intervening list levels.
+    ///
+    /// `descriptions[i]` is paired with `row_addrs[i]`. Results preserve request
+    /// order, and null descriptors produce `None`. Descriptors and row addresses
+    /// are valid only for the dataset version from which they were scanned.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::StructArray;
+    /// # use lance::dataset::Dataset;
+    /// # use lance::Result;
+    /// # async fn example(
+    /// #     dataset: Arc<Dataset>,
+    /// #     descriptions: &StructArray,
+    /// #     row_addresses: &[u64],
+    /// # ) -> Result<()> {
+    /// let blobs = dataset
+    ///     .open_blobs("mystruct.y", descriptions, row_addresses)
+    ///     .await?;
+    /// # let _ = blobs;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn open_blobs(
+        self: &Arc<Self>,
+        column: impl AsRef<str>,
+        descriptions: &StructArray,
+        row_addrs: &[u64],
+    ) -> Result<Vec<Option<BlobFile>>> {
+        blob::open_blobs(self, column.as_ref(), descriptions, row_addrs).await
     }
 
     /// Take [BlobFile] by row indices (offsets in the dataset).

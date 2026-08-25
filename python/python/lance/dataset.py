@@ -89,6 +89,16 @@ from .util import (
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
 
+_BLOB_V2_DESCRIPTOR_TYPE = pa.struct(
+    [
+        pa.field("kind", pa.uint8(), nullable=False),
+        pa.field("position", pa.uint64(), nullable=False),
+        pa.field("size", pa.uint64(), nullable=False),
+        pa.field("blob_id", pa.uint32(), nullable=False),
+        pa.field("blob_uri", pa.string(), nullable=False),
+    ]
+)
+
     from lance.namespace import LanceNamespace
 
     from . import mem_wal
@@ -2337,6 +2347,80 @@ class LanceDataset(pa.dataset.Dataset):
             lance_blob_files = self._ds.take_blobs_by_indices(
                 selection_values, blob_column
             )
+        return [
+            BlobFile(lance_blob_file) if lance_blob_file is not None else None
+            for lance_blob_file in lance_blob_files
+        ]
+
+    def open_blobs(
+        self,
+        blob_column: str,
+        descriptions: Union[
+            pa.StructArray, Sequence[Optional[Dict[str, Any]]]
+        ],
+        row_addresses: Union[Sequence[int], pa.Array, pa.ChunkedArray],
+    ) -> List[Optional[BlobFile]]:
+        """
+        Open lazy blob handles from Blob v2 descriptors.
+
+        Descriptor scans preserve arbitrary struct and list nesting. Select the
+        descriptor leaves to open using normal PyArrow indexing, then pair each
+        descriptor with the physical row address from which it was scanned.
+        List levels are transparent in ``blob_column``. For example,
+        ``"mystruct.y"`` identifies the Blob v2 leaf in
+        ``struct<x: int, y: list<list<blob>>>``.
+
+        Parameters
+        ----------
+        blob_column : str
+            Path to the Blob v2 leaf. Name struct segments and omit list levels.
+        descriptions : pyarrow.StructArray or sequence of dict or None
+            One stored Blob v2 descriptor per blob to open. A sequence of
+            dictionaries, such as values returned by ``StructScalar.as_py()``,
+            is converted to the stable Blob v2 descriptor type.
+        row_addresses : Integer Array or array-like
+            One physical row address per descriptor. Repeat an address when
+            opening multiple blob leaves from the same row.
+
+        Returns
+        -------
+        blob_files : List[Optional[BlobFile]]
+            Lazy handles in request order. Null descriptors return ``None``.
+
+        Notes
+        -----
+        Descriptors and row addresses are valid only for the dataset version
+        from which they were scanned.
+
+        Examples
+        --------
+        For a row containing ``mystruct.y: list<list<blob>>``:
+
+        >>> table = dataset.to_table(
+        ...     columns=["mystruct"], with_row_address=True
+        ... )
+        >>> row = 0
+        >>> row_address = table["_rowaddr"][row].as_py()
+        >>> y = table["mystruct"][row]["y"]
+        >>> blobs = dataset.open_blobs(
+        ...     "mystruct.y",
+        ...     [y[0][1].as_py(), y[4][5].as_py()],
+        ...     [row_address, row_address],
+        ... )
+        """
+        if not isinstance(descriptions, pa.StructArray):
+            descriptions = pa.array(
+                descriptions,
+                type=_BLOB_V2_DESCRIPTOR_TYPE,
+            )
+        if isinstance(row_addresses, (pa.Array, pa.ChunkedArray)):
+            row_addresses = row_addresses.to_pylist()
+        else:
+            row_addresses = list(row_addresses)
+
+        lance_blob_files = self._ds.open_blobs(
+            descriptions, row_addresses, blob_column
+        )
         return [
             BlobFile(lance_blob_file) if lance_blob_file is not None else None
             for lance_blob_file in lance_blob_files

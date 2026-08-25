@@ -2899,6 +2899,83 @@ pub(super) fn validate_blob_column(dataset: &Arc<Dataset>, column: &str) -> Resu
     Ok(blob_field.id as u32)
 }
 
+/// Validate a path to a Blob v2 leaf, treating list levels as transparent.
+pub(super) fn validate_blob_v2_leaf_column(dataset: &Arc<Dataset>, column: &str) -> Result<u32> {
+    let path = parse_field_path(column)?;
+    let schema = dataset.schema();
+    let field = schema
+        .fields
+        .iter()
+        .find(|field| field.name == path[0])
+        .ok_or_else(|| Error::field_not_found(column, schema.field_paths()))?;
+    let blob_field = resolve_blob_v2_leaf(field, &path[1..], column)?;
+    Ok(blob_field.id as u32)
+}
+
+fn resolve_blob_v2_leaf<'a>(
+    field: &'a LanceField,
+    remaining_path: &[String],
+    column: &str,
+) -> Result<&'a LanceField> {
+    if matches!(
+        field.data_type(),
+        ArrowDataType::List(_) | ArrowDataType::LargeList(_)
+    ) {
+        let child = field.children.first().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Blob column '{column}' has a list field '{}' without an item field",
+                field.name
+            ))
+        })?;
+        return resolve_blob_v2_leaf(child, remaining_path, column);
+    }
+
+    if let Some((segment, remaining_path)) = remaining_path.split_first() {
+        let child = field
+            .children
+            .iter()
+            .find(|child| child.name == *segment)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Blob column path '{column}' could not resolve segment '{segment}' below '{}'",
+                    field.name
+                ))
+            })?;
+        return resolve_blob_v2_leaf(child, remaining_path, column);
+    }
+
+    if !field.is_blob_v2() {
+        return Err(Error::invalid_input(format!(
+            "the column '{column}' does not resolve to a Blob v2 leaf"
+        )));
+    }
+    Ok(field)
+}
+
+/// Resolve caller-selected Blob v2 descriptors to lazy handles.
+pub async fn open_blobs(
+    dataset: &Arc<Dataset>,
+    column: &str,
+    descriptions: &StructArray,
+    row_addrs: &[u64],
+) -> Result<Vec<Option<BlobFile>>> {
+    let blob_field_id = validate_blob_v2_leaf_column(dataset, column)?;
+    if BlobV2Layout::classify(descriptions.fields()) != Some(BlobV2Layout::Descriptor) {
+        return Err(Error::invalid_input(format!(
+            "Blob column '{column}' expected Blob v2 descriptors, got fields {:?}",
+            descriptions.fields()
+        )));
+    }
+    if descriptions.len() != row_addrs.len() {
+        return Err(Error::invalid_input(format!(
+            "Blob descriptor count {} did not match row address count {} for column '{column}'",
+            descriptions.len(),
+            row_addrs.len()
+        )));
+    }
+    collect_blob_v2_descriptor_files(dataset, blob_field_id, descriptions, row_addrs).await
+}
+
 /// Load blob descriptor rows for a stable-row-id selection.
 async fn take_blob_descriptions_by_row_ids(
     dataset: &Arc<Dataset>,
@@ -5734,6 +5811,7 @@ mod tests {
                 Some(WriteParams {
                     data_storage_version: Some(LanceFileVersion::V2_2),
                     enable_stable_row_ids: true,
+                    max_rows_per_file: 2,
                     ..Default::default()
                 }),
             )
@@ -5741,13 +5819,9 @@ mod tests {
             .unwrap(),
         );
 
-        let descriptions = dataset
-            .scan()
-            .project(&["blobs"])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let mut scanner = dataset.scan();
+        scanner.project(&["blobs"]).unwrap().with_row_address();
+        let descriptions = scanner.try_into_batch().await.unwrap();
         let lists = descriptions.column(0).as_list::<i32>();
         assert_eq!(lists.offsets().inner().as_ref(), &[0, 3, 3, 3, 4]);
         assert!(lists.is_valid(0));
@@ -5774,6 +5848,85 @@ mod tests {
         assert_eq!(kinds.value(0), BlobKind::Inline as u8);
         assert_eq!(kinds.value(2), BlobKind::Packed as u8);
         assert_eq!(kinds.value(3), BlobKind::Inline as u8);
+
+        let row_addrs = descriptions
+            .column_by_name(ROW_ADDR)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let selected =
+            arrow_select::take::take(descriptors, &UInt64Array::from(vec![2, 0, 1, 3]), None)
+                .unwrap();
+        let selected_row_addrs = [
+            row_addrs.value(0),
+            row_addrs.value(0),
+            row_addrs.value(0),
+            row_addrs.value(3),
+        ];
+        let _ = dataset.object_store.io_stats_incremental();
+        let files = dataset
+            .open_blobs("blobs", selected.as_struct(), &selected_row_addrs)
+            .await
+            .unwrap();
+        let open_stats = dataset.object_store.io_stats_incremental();
+        assert!(
+            !open_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().ends_with(".blob")),
+            "opening BlobFile handles must not read payload sidecars"
+        );
+        assert_eq!(files.len(), 4);
+        assert_eq!(
+            files[0].as_ref().unwrap().size(),
+            packed_payload.len() as u64
+        );
+        assert_eq!(files[1].as_ref().unwrap().size(), 5);
+        assert!(files[2].is_none());
+        assert_eq!(files[3].as_ref().unwrap().size(), 4);
+
+        let selected_range = files[0].as_ref().unwrap().read_range(7..23).await.unwrap();
+        assert_eq!(selected_range.as_ref(), &packed_payload[7..23]);
+        let read_stats = dataset.object_store.io_stats_incremental();
+        let payload_ranges = read_stats
+            .requests
+            .iter()
+            .filter(|request| request.path.as_ref().ends_with(".blob"))
+            .filter_map(|request| request.range.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(payload_ranges.len(), 1);
+        assert_eq!(payload_ranges[0].end - payload_ranges[0].start, 16);
+
+        let mismatched_rows = dataset
+            .open_blobs("blobs", selected.as_struct(), &selected_row_addrs[..1])
+            .await
+            .unwrap_err();
+        assert!(
+            mismatched_rows
+                .to_string()
+                .contains("descriptor count 4 did not match row address count 1")
+        );
+        let invalid_column = dataset
+            .open_blobs("id", selected.as_struct(), &selected_row_addrs)
+            .await
+            .unwrap_err();
+        assert!(
+            invalid_column
+                .to_string()
+                .contains("does not resolve to a Blob v2 leaf")
+        );
+        let invalid_descriptions = StructArray::from(vec![(
+            Arc::new(Field::new("size", DataType::UInt64, false)),
+            Arc::new(UInt64Array::from(vec![1])) as ArrayRef,
+        )]);
+        let invalid_descriptions_error = dataset
+            .open_blobs("blobs", &invalid_descriptions, &selected_row_addrs[..1])
+            .await
+            .unwrap_err();
+        assert!(
+            invalid_descriptions_error
+                .to_string()
+                .contains("expected Blob v2 descriptors")
+        );
 
         let filtered = dataset
             .scan()
@@ -5946,6 +6099,97 @@ mod tests {
         let values = lists.values().as_binary::<i64>();
         assert_eq!(values.value(0), b"nested");
         assert!(values.is_null(1));
+    }
+
+    #[tokio::test]
+    async fn test_open_blobs_from_struct_with_nested_lists() {
+        let test_dir = TempStrDir::default();
+        let mut blob_builder = BlobArrayBuilder::new(4);
+        blob_builder.push_bytes(b"zero-zero").unwrap();
+        blob_builder.push_bytes(b"zero-one").unwrap();
+        blob_builder.push_bytes(b"one-zero").unwrap();
+        blob_builder.push_bytes(b"one-one").unwrap();
+        let blob_values = blob_builder.finish().unwrap();
+
+        let blob_item = Arc::new(blob_field("item", true));
+        let inner_lists: ArrayRef = Arc::new(
+            arrow_array::ListArray::try_new(
+                blob_item.clone(),
+                arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32, 2, 4])),
+                blob_values,
+                None,
+            )
+            .unwrap(),
+        );
+        let inner_list_item = Arc::new(Field::new("item", DataType::List(blob_item), true));
+        let outer_lists: ArrayRef = Arc::new(
+            arrow_array::ListArray::try_new(
+                inner_list_item.clone(),
+                arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32, 2])),
+                inner_lists,
+                None,
+            )
+            .unwrap(),
+        );
+        let mystruct_fields = vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("y", DataType::List(inner_list_item), true),
+        ];
+        let mystruct: ArrayRef = Arc::new(
+            StructArray::try_new(
+                mystruct_fields.clone().into(),
+                vec![Arc::new(Int32Array::from(vec![7])) as ArrayRef, outer_lists],
+                None,
+            )
+            .unwrap(),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "mystruct",
+            DataType::Struct(mystruct_fields.into()),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![mystruct]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let mut scanner = dataset.scan();
+        scanner.project(&["mystruct"]).unwrap().with_row_address();
+        let descriptions = scanner.try_into_batch().await.unwrap();
+        let mystruct = descriptions.column(0).as_struct();
+        let outer = mystruct.column_by_name("y").unwrap().as_list::<i32>();
+        let inner = outer.values().as_list::<i32>();
+        let descriptors = inner.values().as_struct();
+        let selected =
+            arrow_select::take::take(descriptors, &UInt64Array::from(vec![1, 3]), None).unwrap();
+        let row_addr = descriptions
+            .column_by_name(ROW_ADDR)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .value(0);
+
+        let files = dataset
+            .open_blobs("mystruct.y", selected.as_struct(), &[row_addr, row_addr])
+            .await
+            .unwrap();
+        assert_eq!(
+            files[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"zero-one"
+        );
+        assert_eq!(
+            files[1].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"one-one"
+        );
     }
 
     #[tokio::test]
