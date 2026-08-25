@@ -4,7 +4,7 @@
 //! Lance Dataset
 //!
 
-use arrow_array::{RecordBatch, RecordBatchReader, StructArray};
+use arrow_array::{RecordBatch, RecordBatchReader};
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{Duration, prelude::*};
 use futures::future::BoxFuture;
@@ -140,8 +140,8 @@ use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
 pub use blob::{
-    BlobFile, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
-    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
+    BlobFile, BlobOpenRequest, BlobRangeRequest, BlobReadRange, BlobV2Descriptor, ReadBlob,
+    ReadBlobRange, ReadBlobRangesBuilder, ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
 };
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
@@ -1833,34 +1833,34 @@ impl Dataset {
     /// transparent in `column`, so `info.groups.blobs` can identify a blob leaf
     /// below any number of intervening list levels.
     ///
-    /// `descriptions[i]` is paired with `row_addrs[i]`. Results preserve request
-    /// order, and null descriptors produce `None`. Descriptors and row addresses
-    /// are valid only for the dataset version from which they were scanned.
+    /// Each [`BlobOpenRequest`] owns the leaf column path, stored descriptor, and
+    /// physical row address needed to resolve one handle. Results preserve
+    /// request order, and null descriptors produce `None`. Descriptors and row
+    /// addresses are valid only for the dataset version from which they were
+    /// scanned.
     ///
     /// ```
     /// # use std::sync::Arc;
     /// # use arrow_array::StructArray;
-    /// # use lance::dataset::Dataset;
+    /// # use lance::dataset::{BlobOpenRequest, Dataset};
     /// # use lance::Result;
     /// # async fn example(
     /// #     dataset: Arc<Dataset>,
     /// #     descriptions: &StructArray,
-    /// #     row_addresses: &[u64],
+    /// #     row_address: u64,
     /// # ) -> Result<()> {
-    /// let blobs = dataset
-    ///     .open_blobs("mystruct.y", descriptions, row_addresses)
-    ///     .await?;
+    /// let request =
+    ///     BlobOpenRequest::try_from_array("mystruct.y", descriptions, 0, row_address)?;
+    /// let blobs = dataset.open_blobs(&[request]).await?;
     /// # let _ = blobs;
     /// # Ok(())
     /// # }
     /// ```
     pub async fn open_blobs(
         self: &Arc<Self>,
-        column: impl AsRef<str>,
-        descriptions: &StructArray,
-        row_addrs: &[u64],
+        requests: &[BlobOpenRequest],
     ) -> Result<Vec<Option<BlobFile>>> {
-        blob::open_blobs(self, column.as_ref(), descriptions, row_addrs).await
+        blob::open_blobs(self, requests).await
     }
 
     /// Take [BlobFile] by row indices (offsets in the dataset).

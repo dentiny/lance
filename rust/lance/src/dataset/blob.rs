@@ -1765,6 +1765,82 @@ impl BlobReadRange {
     }
 }
 
+/// One stored Blob v2 descriptor selected from a descriptor scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobV2Descriptor {
+    /// Physical storage kind used by this blob.
+    pub kind: BlobKind,
+    /// Byte offset in the resolved data file or object.
+    pub position: u64,
+    /// Logical payload size in bytes.
+    pub size: u64,
+    /// Packed file id, dedicated file id, or external base id.
+    pub blob_id: u32,
+    /// External URI or relative path. Empty for Lance-managed blobs.
+    pub blob_uri: String,
+}
+
+impl BlobV2Descriptor {
+    /// Read one optional descriptor from a descriptor scan array.
+    pub fn try_from_array(descriptions: &StructArray, index: usize) -> Result<Option<Self>> {
+        if BlobV2Layout::classify(descriptions.fields()) != Some(BlobV2Layout::Descriptor) {
+            return Err(Error::invalid_input(format!(
+                "Expected Blob v2 descriptors, got fields {:?}",
+                descriptions.fields()
+            )));
+        }
+        if index >= descriptions.len() {
+            return Err(Error::invalid_input(format!(
+                "Blob descriptor index {index} is outside array length {}",
+                descriptions.len()
+            )));
+        }
+        BlobV2DescriptorColumns::new(descriptions).descriptor(index)
+    }
+}
+
+/// One request to open a lazy [`BlobFile`] from a stored Blob v2 descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobOpenRequest {
+    /// Path to the Blob v2 leaf. Struct segments are named; list levels are
+    /// transparent.
+    pub column: String,
+    /// Stored descriptor selected from a descriptor scan, or `None` for a null
+    /// blob value.
+    pub descriptor: Option<BlobV2Descriptor>,
+    /// Physical row address from the same dataset version as `descriptor`.
+    pub row_address: u64,
+}
+
+impl BlobOpenRequest {
+    /// Create one blob-open request.
+    pub fn new(
+        column: impl Into<String>,
+        descriptor: Option<BlobV2Descriptor>,
+        row_address: u64,
+    ) -> Self {
+        Self {
+            column: column.into(),
+            descriptor,
+            row_address,
+        }
+    }
+
+    /// Create one request from a row in a descriptor scan array.
+    pub fn try_from_array(
+        column: impl Into<String>,
+        descriptions: &StructArray,
+        descriptor_index: usize,
+        row_address: u64,
+    ) -> Result<Self> {
+        Ok(Self::new(
+            column,
+            BlobV2Descriptor::try_from_array(descriptions, descriptor_index)?,
+            row_address,
+        ))
+    }
+}
+
 /// One row-specific blob range read request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlobRangeRequest {
@@ -2955,25 +3031,34 @@ fn resolve_blob_v2_leaf<'a>(
 /// Resolve caller-selected Blob v2 descriptors to lazy handles.
 pub async fn open_blobs(
     dataset: &Arc<Dataset>,
-    column: &str,
-    descriptions: &StructArray,
-    row_addrs: &[u64],
+    requests: &[BlobOpenRequest],
 ) -> Result<Vec<Option<BlobFile>>> {
-    let blob_field_id = validate_blob_v2_leaf_column(dataset, column)?;
-    if BlobV2Layout::classify(descriptions.fields()) != Some(BlobV2Layout::Descriptor) {
-        return Err(Error::invalid_input(format!(
-            "Blob column '{column}' expected Blob v2 descriptors, got fields {:?}",
-            descriptions.fields()
-        )));
+    let mut field_ids = HashMap::<String, u32>::new();
+    let mut read_contexts = HashMap::<u32, BlobV2ReadContext<'_>>::new();
+    let mut files = Vec::with_capacity(requests.len());
+
+    for request in requests {
+        let blob_field_id = if let Some(field_id) = field_ids.get(&request.column) {
+            *field_id
+        } else {
+            let field_id = validate_blob_v2_leaf_column(dataset, &request.column)?;
+            field_ids.insert(request.column.clone(), field_id);
+            field_id
+        };
+        let file = if let Some(descriptor) = &request.descriptor {
+            read_contexts
+                .entry(blob_field_id)
+                .or_insert_with(|| BlobV2ReadContext::new(dataset, blob_field_id))
+                .collect_descriptor(descriptor, request.row_address)
+                .await
+                .map(Some)?
+        } else {
+            None
+        };
+        files.push(file);
     }
-    if descriptions.len() != row_addrs.len() {
-        return Err(Error::invalid_input(format!(
-            "Blob descriptor count {} did not match row address count {} for column '{column}'",
-            descriptions.len(),
-            row_addrs.len()
-        )));
-    }
-    collect_blob_v2_descriptor_files(dataset, blob_field_id, descriptions, row_addrs).await
+
+    Ok(files)
 }
 
 /// Load blob descriptor rows for a stable-row-id selection.
@@ -3175,6 +3260,31 @@ impl<'a> BlobV2DescriptorColumns<'a> {
 
     fn is_null_blob(&self, idx: usize) -> bool {
         self.descriptions.is_null(idx) || self.kinds.is_null(idx)
+    }
+
+    fn descriptor(&self, idx: usize) -> Result<Option<BlobV2Descriptor>> {
+        if self.is_null_blob(idx) {
+            return Ok(None);
+        }
+        for (name, array) in [
+            ("position", self.positions as &dyn Array),
+            ("size", self.sizes as &dyn Array),
+            ("blob_id", self.blob_ids as &dyn Array),
+            ("blob_uri", self.blob_uris as &dyn Array),
+        ] {
+            if array.is_null(idx) {
+                return Err(Error::invalid_input(format!(
+                    "Blob v2 descriptor field '{name}' is null at index {idx}"
+                )));
+            }
+        }
+        Ok(Some(BlobV2Descriptor {
+            kind: BlobKind::try_from(self.kinds.value(idx))?,
+            position: self.positions.value(idx),
+            size: self.sizes.value(idx),
+            blob_id: self.blob_ids.value(idx),
+            blob_uri: self.blob_uris.value(idx).to_string(),
+        }))
     }
 }
 
@@ -3665,16 +3775,79 @@ impl<'a> BlobV2ReadContext<'a> {
         if columns.is_null_blob(idx) {
             return Ok(None);
         }
-
         let kind = BlobKind::try_from(columns.kinds.value(idx))?;
         let file = match kind {
-            BlobKind::Inline => self.collect_inline(columns, idx, row_addr).await?,
-            BlobKind::Dedicated => self.collect_dedicated(columns, idx, row_addr).await?,
-            BlobKind::Packed => self.collect_packed(columns, idx, row_addr).await?,
-            BlobKind::External => self.collect_external(columns, idx).await?,
+            BlobKind::Inline => {
+                self.collect_inline(
+                    columns.positions.value(idx),
+                    columns.sizes.value(idx),
+                    row_addr,
+                )
+                .await?
+            }
+            BlobKind::Dedicated => {
+                self.collect_dedicated(
+                    columns.blob_ids.value(idx),
+                    columns.sizes.value(idx),
+                    row_addr,
+                )
+                .await?
+            }
+            BlobKind::Packed => {
+                self.collect_packed(
+                    columns.blob_ids.value(idx),
+                    columns.positions.value(idx),
+                    columns.sizes.value(idx),
+                    row_addr,
+                )
+                .await?
+            }
+            BlobKind::External => {
+                self.collect_external(
+                    columns.blob_uris.value(idx),
+                    columns.blob_ids.value(idx),
+                    columns.positions.value(idx),
+                    columns.sizes.value(idx),
+                )
+                .await?
+            }
         };
-
         Ok(Some(file))
+    }
+
+    async fn collect_descriptor(
+        &mut self,
+        descriptor: &BlobV2Descriptor,
+        row_addr: u64,
+    ) -> Result<BlobFile> {
+        match descriptor.kind {
+            BlobKind::Inline => {
+                self.collect_inline(descriptor.position, descriptor.size, row_addr)
+                    .await
+            }
+            BlobKind::Dedicated => {
+                self.collect_dedicated(descriptor.blob_id, descriptor.size, row_addr)
+                    .await
+            }
+            BlobKind::Packed => {
+                self.collect_packed(
+                    descriptor.blob_id,
+                    descriptor.position,
+                    descriptor.size,
+                    row_addr,
+                )
+                .await
+            }
+            BlobKind::External => {
+                self.collect_external(
+                    &descriptor.blob_uri,
+                    descriptor.blob_id,
+                    descriptor.position,
+                    descriptor.size,
+                )
+                .await
+            }
+        }
     }
 
     async fn blob_read_location(&mut self, row_addr: u64) -> Result<BlobReadLocation> {
@@ -3690,12 +3863,10 @@ impl<'a> BlobV2ReadContext<'a> {
 
     async fn collect_inline(
         &mut self,
-        columns: &BlobV2DescriptorColumns<'_>,
-        idx: usize,
+        position: u64,
+        size: u64,
         row_addr: u64,
     ) -> Result<BlobFile> {
-        let position = columns.positions.value(idx);
-        let size = columns.sizes.value(idx);
         let location = self.blob_read_location(row_addr).await?;
         let source = shared_blob_source(
             &mut self.source_cache,
@@ -3713,12 +3884,10 @@ impl<'a> BlobV2ReadContext<'a> {
 
     async fn collect_dedicated(
         &mut self,
-        columns: &BlobV2DescriptorColumns<'_>,
-        idx: usize,
+        blob_id: u32,
+        size: u64,
         row_addr: u64,
     ) -> Result<BlobFile> {
-        let blob_id = columns.blob_ids.value(idx);
-        let size = columns.sizes.value(idx);
         let location = self.blob_read_location(row_addr).await?;
         let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
         let source = shared_blob_source(&mut self.source_cache, location.object_store, &path);
@@ -3733,13 +3902,11 @@ impl<'a> BlobV2ReadContext<'a> {
 
     async fn collect_packed(
         &mut self,
-        columns: &BlobV2DescriptorColumns<'_>,
-        idx: usize,
+        blob_id: u32,
+        position: u64,
+        size: u64,
         row_addr: u64,
     ) -> Result<BlobFile> {
-        let blob_id = columns.blob_ids.value(idx);
-        let size = columns.sizes.value(idx);
-        let position = columns.positions.value(idx);
         let location = self.blob_read_location(row_addr).await?;
         let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
         let source = shared_blob_source(&mut self.source_cache, location.object_store, &path);
@@ -3754,13 +3921,12 @@ impl<'a> BlobV2ReadContext<'a> {
 
     async fn collect_external(
         &mut self,
-        columns: &BlobV2DescriptorColumns<'_>,
-        idx: usize,
+        uri_or_path: &str,
+        base_id: u32,
+        position: u64,
+        size: u64,
     ) -> Result<BlobFile> {
-        let uri_or_path = columns.blob_uris.value(idx).to_string();
-        let position = columns.positions.value(idx);
-        let size = columns.sizes.value(idx);
-        let base_id = columns.blob_ids.value(idx);
+        let uri_or_path = uri_or_path.to_string();
         let (object_store, path) = if base_id == 0 {
             let registry = self.dataset.session.store_registry();
             let params = self
@@ -3952,11 +4118,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        BlobEntry, BlobFile, BlobRangeRequest, BlobReadRange, BlobSource, ExternalBaseCandidate,
-        ExternalBaseResolver, ReadBlobsExecution, blob_version_from_descriptions,
-        collect_blob_files_v1, data_file_key_from_path, execute_blob_entries,
-        execute_blob_read_batches_stream, execute_blob_read_plan, plan_blob_read_batches,
-        plan_blob_read_plans,
+        BlobEntry, BlobFile, BlobOpenRequest, BlobRangeRequest, BlobReadRange, BlobSource,
+        ExternalBaseCandidate, ExternalBaseResolver, ReadBlobsExecution,
+        blob_version_from_descriptions, collect_blob_files_v1, data_file_key_from_path,
+        execute_blob_entries, execute_blob_read_batches_stream, execute_blob_read_plan,
+        plan_blob_read_batches, plan_blob_read_plans,
     };
     use crate::{
         Dataset,
@@ -5862,11 +6028,16 @@ mod tests {
             row_addrs.value(0),
             row_addrs.value(3),
         ];
-        let _ = dataset.object_store.io_stats_incremental();
-        let files = dataset
-            .open_blobs("blobs", selected.as_struct(), &selected_row_addrs)
-            .await
+        let requests = selected_row_addrs
+            .iter()
+            .enumerate()
+            .map(|(index, row_address)| {
+                BlobOpenRequest::try_from_array("blobs", selected.as_struct(), index, *row_address)
+            })
+            .collect::<Result<Vec<_>>>()
             .unwrap();
+        let _ = dataset.object_store.io_stats_incremental();
+        let files = dataset.open_blobs(&requests).await.unwrap();
         let open_stats = dataset.object_store.io_stats_incremental();
         assert!(
             !open_stats
@@ -5896,17 +6067,16 @@ mod tests {
         assert_eq!(payload_ranges.len(), 1);
         assert_eq!(payload_ranges[0].end - payload_ranges[0].start, 16);
 
-        let mismatched_rows = dataset
-            .open_blobs("blobs", selected.as_struct(), &selected_row_addrs[..1])
-            .await
-            .unwrap_err();
-        assert!(
-            mismatched_rows
-                .to_string()
-                .contains("descriptor count 4 did not match row address count 1")
-        );
+        let invalid_column_requests = requests
+            .iter()
+            .cloned()
+            .map(|mut request| {
+                request.column = "id".to_string();
+                request
+            })
+            .collect::<Vec<_>>();
         let invalid_column = dataset
-            .open_blobs("id", selected.as_struct(), &selected_row_addrs)
+            .open_blobs(&invalid_column_requests)
             .await
             .unwrap_err();
         assert!(
@@ -5918,14 +6088,13 @@ mod tests {
             Arc::new(Field::new("size", DataType::UInt64, false)),
             Arc::new(UInt64Array::from(vec![1])) as ArrayRef,
         )]);
-        let invalid_descriptions_error = dataset
-            .open_blobs("blobs", &invalid_descriptions, &selected_row_addrs[..1])
-            .await
-            .unwrap_err();
+        let invalid_descriptions_error =
+            BlobOpenRequest::try_from_array("blobs", &invalid_descriptions, 0, row_addrs.value(0))
+                .unwrap_err();
         assert!(
             invalid_descriptions_error
                 .to_string()
-                .contains("expected Blob v2 descriptors")
+                .contains("Expected Blob v2 descriptors")
         );
 
         let filtered = dataset
@@ -6178,10 +6347,14 @@ mod tests {
             .as_primitive::<UInt64Type>()
             .value(0);
 
-        let files = dataset
-            .open_blobs("mystruct.y", selected.as_struct(), &[row_addr, row_addr])
-            .await
+        let requests = [0, 1]
+            .into_iter()
+            .map(|index| {
+                BlobOpenRequest::try_from_array("mystruct.y", selected.as_struct(), index, row_addr)
+            })
+            .collect::<Result<Vec<_>>>()
             .unwrap();
+        let files = dataset.open_blobs(&requests).await.unwrap();
         assert_eq!(
             files[0].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"zero-one"

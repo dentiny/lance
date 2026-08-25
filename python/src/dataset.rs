@@ -1707,13 +1707,28 @@ impl Dataset {
                     descriptions.data_type()
                 ))
             })?;
+        if descriptions.len() != row_addresses.len() {
+            return Err(PyValueError::new_err(format!(
+                "description count {} did not match row address count {}",
+                descriptions.len(),
+                row_addresses.len()
+            )));
+        }
+        let requests = row_addresses
+            .iter()
+            .enumerate()
+            .map(|(index, row_address)| {
+                lance::dataset::BlobOpenRequest::try_from_array(
+                    blob_column,
+                    descriptions,
+                    index,
+                    *row_address,
+                )
+            })
+            .collect::<lance::Result<Vec<_>>>()
+            .infer_error()?;
         let blobs = rt()
-            .block_on(
-                Some(self_.py()),
-                self_
-                    .ds
-                    .open_blobs(blob_column, descriptions, &row_addresses),
-            )?
+            .block_on(Some(self_.py()), self_.ds.open_blobs(&requests))?
             .infer_error()?;
         Ok(blobs
             .into_iter()
