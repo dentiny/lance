@@ -140,8 +140,8 @@ use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
 pub use blob::{
-    BlobFile, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
-    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
+    BlobFile, BlobOpenRequest, BlobRangeRequest, BlobReadRange, BlobV2Descriptor, ReadBlob,
+    ReadBlobRange, ReadBlobRangesBuilder, ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
 };
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
@@ -1823,6 +1823,44 @@ impl Dataset {
         column: impl AsRef<str>,
     ) -> Result<Vec<Option<BlobFile>>> {
         blob::take_blobs_by_addresses(self, row_addrs, column.as_ref()).await
+    }
+
+    /// Open lazy [`BlobFile`] handles from Blob v2 descriptors.
+    ///
+    /// Descriptor scans preserve arbitrary struct and list nesting. Callers can
+    /// select the descriptor leaves they need with Arrow operations, then pass
+    /// them here with the physical row address of each leaf. List levels are
+    /// transparent in `column`, so `info.groups.blobs` can identify a blob leaf
+    /// below any number of intervening list levels.
+    ///
+    /// Each [`BlobOpenRequest`] owns the leaf column path, stored descriptor, and
+    /// physical row address needed to resolve one handle. Results preserve
+    /// request order, and null descriptors produce `None`. Descriptors and row
+    /// addresses are valid only for the dataset version from which they were
+    /// scanned.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::StructArray;
+    /// # use lance::dataset::{BlobOpenRequest, Dataset};
+    /// # use lance::Result;
+    /// # async fn example(
+    /// #     dataset: Arc<Dataset>,
+    /// #     descriptions: &StructArray,
+    /// #     row_address: u64,
+    /// # ) -> Result<()> {
+    /// let request =
+    ///     BlobOpenRequest::try_from_array("mystruct.y", descriptions, 0, row_address)?;
+    /// let blobs = dataset.open_blobs(&[request]).await?;
+    /// # let _ = blobs;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn open_blobs(
+        self: &Arc<Self>,
+        requests: &[BlobOpenRequest],
+    ) -> Result<Vec<Option<BlobFile>>> {
+        blob::open_blobs(self, requests).await
     }
 
     /// Take [BlobFile] by row indices (offsets in the dataset).

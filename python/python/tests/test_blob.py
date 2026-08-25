@@ -2359,6 +2359,24 @@ def test_write_list_struct_nested_blob_v2(tmp_path):
         data_storage_version="2.2",
     )
 
+    descriptions = dataset.to_table(columns=["media"], with_row_address=True)
+    media_descriptions = descriptions.column("media").combine_chunks()
+    row_addresses = descriptions.column("_rowaddr").to_pylist()
+    row0 = media_descriptions[0].values
+    row1 = media_descriptions[1].values
+    opened = dataset.open_blobs(
+        "media.payload.blob",
+        [
+            row0[1]["payload"]["blob"].as_py(),
+            row0[0]["payload"]["blob"].as_py(),
+            row1[0]["payload"]["blob"].as_py(),
+        ],
+        [row_addresses[0], row_addresses[0], row_addresses[1]],
+    )
+    assert opened[0].read() == b"second"
+    assert opened[1].read() == b"first"
+    assert opened[2] is None
+
     media = (
         dataset.scanner(columns=["media"], blob_handling="all_binary")
         .to_table()

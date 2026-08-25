@@ -1691,6 +1691,51 @@ impl Dataset {
             .collect())
     }
 
+    fn open_blobs(
+        self_: PyRef<'_, Self>,
+        descriptions: PyArrowType<ArrayData>,
+        row_addresses: Vec<u64>,
+        blob_column: &str,
+    ) -> PyResult<Vec<Option<LanceBlobFile>>> {
+        let descriptions = make_array(descriptions.0);
+        let descriptions = descriptions
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .ok_or_else(|| {
+                PyTypeError::new_err(format!(
+                    "descriptions must be a pyarrow.StructArray, got {}",
+                    descriptions.data_type()
+                ))
+            })?;
+        if descriptions.len() != row_addresses.len() {
+            return Err(PyValueError::new_err(format!(
+                "description count {} did not match row address count {}",
+                descriptions.len(),
+                row_addresses.len()
+            )));
+        }
+        let requests = row_addresses
+            .iter()
+            .enumerate()
+            .map(|(index, row_address)| {
+                lance::dataset::BlobOpenRequest::try_from_array(
+                    blob_column,
+                    descriptions,
+                    index,
+                    *row_address,
+                )
+            })
+            .collect::<lance::Result<Vec<_>>>()
+            .infer_error()?;
+        let blobs = rt()
+            .block_on(Some(self_.py()), self_.ds.open_blobs(&requests))?
+            .infer_error()?;
+        Ok(blobs
+            .into_iter()
+            .map(|blob| blob.map(LanceBlobFile::from))
+            .collect())
+    }
+
     fn take_blobs_by_indices(
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,

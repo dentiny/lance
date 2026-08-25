@@ -437,6 +437,12 @@ class _Dataset:
         row_addresses: List[int],
         blob_column: str,
     ) -> List[Optional[LanceBlobFile]]: ...
+    def open_blobs(
+        self,
+        descriptions: pa.StructArray,
+        row_addresses: List[int],
+        blob_column: str,
+    ) -> List[Optional[LanceBlobFile]]: ...
     def take_blobs_by_indices(
         self,
         row_indices: List[int],
