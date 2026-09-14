@@ -16702,6 +16702,33 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 
     #[tokio::test]
+    async fn test_filter_not_in_is_not_inverted() {
+        let ds = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+
+        let ds_copy = ds.clone();
+        let check = async move |filt: &str, expected_idx: &[i32]| {
+            let mut scanner = ds_copy.scan();
+            scanner.filter(filt).unwrap();
+            let batch = scanner.try_into_batch().await.unwrap();
+            let idx = batch.column_by_name("idx").unwrap();
+            assert_eq!(
+                idx.as_primitive::<Int32Type>().values(),
+                expected_idx,
+                "wrong rows for filter '{filt}'"
+            );
+        };
+
+        // Single fragment, so _rowid == _rowaddr == idx.
+        let complement: &[i32] = &[0, 1, 3, 5, 7, 9];
+        check("_rowid NOT IN (2, 4, 6, 8)", complement).await;
+        check("_rowaddr NOT IN (2, 4, 6, 8)", complement).await;
+    }
+
+    #[tokio::test]
     async fn test_nested_field_ordering() {
         use arrow_array::StructArray;
 
