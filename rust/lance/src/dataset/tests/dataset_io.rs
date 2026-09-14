@@ -1952,12 +1952,15 @@ async fn test_deep_clone_copies_blob_v2_sidecars() {
         RecordBatchIterator::new([Ok(batch)], schema),
         source_dir.to_str().unwrap(),
         Some(WriteParams {
+            max_rows_per_file: 1,
+            max_rows_per_group: 1,
             data_storage_version: Some(LanceFileVersion::V2_2),
             ..Default::default()
         }),
     )
     .await
     .unwrap();
+    assert_eq!(source.count_fragments(), 2);
     source
         .create_index(
             &["id"],
@@ -1976,6 +1979,15 @@ async fn test_deep_clone_copies_blob_v2_sidecars() {
     let source_index_file_count =
         count_files(source.object_store.as_ref(), &source.base, "_indices").await;
     assert!(source_index_file_count > 0);
+    let copy_paths = source.collect_paths().await.unwrap();
+    assert_eq!(
+        copy_paths
+            .iter()
+            .filter(|(path, _)| path.ends_with(".blob"))
+            .count(),
+        2,
+        "deep clone must discover both packed and dedicated Blob v2 sidecars"
+    );
 
     let cloned = Arc::new(
         source
