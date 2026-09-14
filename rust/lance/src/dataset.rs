@@ -3467,6 +3467,14 @@ impl Dataset {
                     base_root.clone(),
                 ));
 
+                if !data_file
+                    .schema(self.schema())
+                    .fields_pre_order()
+                    .any(|field| field.is_blob_v2())
+                {
+                    continue;
+                }
+
                 // Blob v2 sidecars are not listed in the manifest. Their directory is
                 // derived from the owning data file, so enumerate it to copy packed and
                 // dedicated payloads without decoding blob descriptors. External blobs
