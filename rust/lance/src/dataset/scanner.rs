@@ -1370,6 +1370,7 @@ impl TakeOperation {
                 _ => {}
             }
         } else if let Expr::InList(in_expr) = expr
+            && !in_expr.negated
             && let Expr::Column(col) = in_expr.expr.as_ref()
             && let Some(u64s) = Self::extract_u64_list(&in_expr.list)
         {
