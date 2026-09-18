@@ -53,7 +53,7 @@ use crate::dataset::blob::{
 };
 use crate::index::DatasetIndexExt;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
-use crate::session::Session;
+use crate::session::{ExternalBlobUriResolver, Session};
 
 use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
@@ -945,6 +945,14 @@ where
         .map(|ds| ds.session.store_registry())
         .unwrap_or_else(|| params.store_registry());
     let source_store_params = params.store_params.clone().unwrap_or_default();
+    let external_blob_uri_resolver = dataset
+        .and_then(|ds| ds.session.external_blob_uri_resolver())
+        .or_else(|| {
+            params
+                .session
+                .as_ref()
+                .and_then(|session| session.external_blob_uri_resolver())
+        });
 
     // Keep a copy so failure paths can clean up files written to target bases.
     let cleanup_bases = target_bases_info.clone();
@@ -960,6 +968,7 @@ where
         params.external_blob_mode,
         source_store_registry,
         source_store_params,
+        external_blob_uri_resolver,
         params.blob_pack_file_size_threshold,
         file_writer_options,
     );
@@ -2065,6 +2074,7 @@ pub(crate) struct WriterOptions {
     external_blob_mode: ExternalBlobMode,
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
+    external_blob_uri_resolver: Option<Arc<dyn ExternalBlobUriResolver>>,
     blob_pack_file_size_threshold: Option<usize>,
     file_writer_options: FileWriterOptions,
 }
@@ -2174,6 +2184,7 @@ where
         external_blob_mode,
         source_store_registry,
         source_store_params,
+        external_blob_uri_resolver,
         blob_pack_file_size_threshold,
         file_writer_options,
     } = options;
@@ -2198,7 +2209,8 @@ where
         source_store_registry,
         source_store_params,
         blob_pack_file_size_threshold,
-    )?;
+    )?
+    .with_external_blob_uri_resolver(external_blob_uri_resolver);
     Ok(Box::new(V2WriterAdapter {
         writer: file_writer,
         data_file: Some(data_file),
@@ -2254,6 +2266,7 @@ struct WriterGenerator<OpenWriter> {
     external_blob_mode: ExternalBlobMode,
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
+    external_blob_uri_resolver: Option<Arc<dyn ExternalBlobUriResolver>>,
     blob_pack_file_size_threshold: Option<usize>,
     file_writer_options: FileWriterOptions,
     /// Counter for round-robin selection
@@ -2277,6 +2290,7 @@ where
         external_blob_mode: ExternalBlobMode,
         source_store_registry: Arc<ObjectStoreRegistry>,
         source_store_params: ObjectStoreParams,
+        external_blob_uri_resolver: Option<Arc<dyn ExternalBlobUriResolver>>,
         blob_pack_file_size_threshold: Option<usize>,
         file_writer_options: FileWriterOptions,
     ) -> Self {
@@ -2291,6 +2305,7 @@ where
             external_blob_mode,
             source_store_registry,
             source_store_params,
+            external_blob_uri_resolver,
             blob_pack_file_size_threshold,
             file_writer_options,
             next_base_index: AtomicUsize::new(0),
@@ -2327,6 +2342,7 @@ where
                     external_blob_mode: self.external_blob_mode,
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
+                    external_blob_uri_resolver: self.external_blob_uri_resolver.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
                     file_writer_options: self.file_writer_options.clone(),
                 },
@@ -2345,6 +2361,7 @@ where
                     external_blob_mode: self.external_blob_mode,
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
+                    external_blob_uri_resolver: self.external_blob_uri_resolver.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
                     file_writer_options: self.file_writer_options.clone(),
                 },
@@ -3277,6 +3294,7 @@ mod tests {
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
             None,
+            None,
             FileWriterOptions::default(),
         );
 
@@ -3395,6 +3413,7 @@ mod tests {
             ExternalBlobMode::Reference,
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
+            None,
             None,
             FileWriterOptions::default(),
         );

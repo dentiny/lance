@@ -42,6 +42,7 @@ use crate::blob::{
     BlobDescriptor, BlobDescriptorArrayBuilder, BlobIdAllocator, BlobRange, PackedBlobWriter,
     blob_v2_layout, blob_v2_shape_error, validate_prepared_blob_array,
 };
+use crate::session::ExternalBlobUriResolver;
 use arrow_array::StructArray;
 use lance_core::datatypes::{
     BLOB_DESC_FIELDS, BlobKind, BlobV2Layout, BlobVersion, Field as LanceField, Schema,
@@ -455,6 +456,7 @@ pub struct BlobPreprocessor {
     external_blob_mode: ExternalBlobMode,
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
+    external_blob_uri_resolver: Option<Arc<dyn ExternalBlobUriResolver>>,
 }
 
 /// A logical slice of an external blob that can be materialized or streamed into Lance-managed
@@ -664,7 +666,16 @@ impl BlobPreprocessor {
             external_blob_mode,
             source_store_registry,
             source_store_params,
+            external_blob_uri_resolver: None,
         })
+    }
+
+    pub(super) fn with_external_blob_uri_resolver(
+        mut self,
+        resolver: Option<Arc<dyn ExternalBlobUriResolver>>,
+    ) -> Self {
+        self.external_blob_uri_resolver = resolver;
+        self
     }
 
     pub(super) fn with_part_blob_ids(mut self, blob_ids: Range<u32>) -> Result<Self> {
@@ -850,9 +861,14 @@ impl BlobPreprocessor {
         position: Option<u64>,
         size: Option<u64>,
     ) -> Result<ExternalBlobSource> {
+        let resolved_uri = match &self.external_blob_uri_resolver {
+            Some(resolver) => Some(resolver.resolve_uri(uri).await?),
+            None => None,
+        };
+        let fetch_uri = resolved_uri.as_deref().unwrap_or(uri);
         let (object_store, path) = ObjectStore::from_uri_and_params(
             self.source_store_registry.clone(),
-            uri,
+            fetch_uri,
             &self.source_store_params,
         )
         .await?;
@@ -4536,6 +4552,11 @@ impl<'a> BlobV2ReadContext<'a> {
         let size = columns.sizes.value(idx);
         let base_id = columns.blob_ids.value(idx);
         let (object_store, path) = if base_id == 0 {
+            let resolved_uri = match self.dataset.session.external_blob_uri_resolver() {
+                Some(resolver) => Some(resolver.resolve_uri(&uri_or_path).await?),
+                None => None,
+            };
+            let fetch_uri = resolved_uri.as_deref().unwrap_or(&uri_or_path);
             let registry = self.dataset.session.store_registry();
             let params = self
                 .dataset
@@ -4543,7 +4564,7 @@ impl<'a> BlobV2ReadContext<'a> {
                 .as_ref()
                 .map(|p| Arc::new((**p).clone()))
                 .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
-            ObjectStore::from_uri_and_params(registry, &uri_or_path, &params).await?
+            ObjectStore::from_uri_and_params(registry, fetch_uri, &params).await?
         } else {
             let object_store = if let Some(store) = self.store_cache.get(&base_id) {
                 store.clone()
@@ -4743,6 +4764,7 @@ mod tests {
             scanner::MaterializationStyle,
             transaction::{DataReplacementGroup, Operation, Transaction},
         },
+        session::{ExternalBlobUriResolver, Session},
         utils::test::TestDatasetGenerator,
     };
 
@@ -4756,6 +4778,19 @@ mod tests {
         _test_dir: TempDir,
         dataset: Arc<Dataset>,
         expected: Vec<u8>,
+    }
+
+    struct FixedExternalBlobUriResolver {
+        resolved_uri: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ExternalBlobUriResolver for FixedExternalBlobUriResolver {
+        async fn resolve_uri(&self, _uri: &str) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.resolved_uri.clone())
+        }
     }
 
     #[test]
@@ -8326,6 +8361,80 @@ mod tests {
             blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"outside"
         );
+    }
+
+    #[rstest]
+    #[case::ingest(ExternalBlobMode::Ingest, false)]
+    #[case::reference(ExternalBlobMode::Reference, true)]
+    #[tokio::test]
+    async fn test_external_blob_uri_resolver(
+        #[case] external_blob_mode: ExternalBlobMode,
+        #[case] allow_external_blob_outside_bases: bool,
+    ) {
+        let test_dir = TempDir::default();
+        let dataset_path = test_dir.std_path().join("dataset");
+        let resolved_path = test_dir.std_path().join("resolved.bin");
+        std::fs::write(&resolved_path, b"resolved").unwrap();
+        let resolved_uri = format!("file://{}", resolved_path.display());
+        let missing_uri = format!(
+            "file://{}",
+            test_dir.std_path().join("missing.bin").display()
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = Arc::new(Session::default().with_external_blob_uri_resolver(Arc::new(
+            FixedExternalBlobUriResolver {
+                resolved_uri,
+                calls: calls.clone(),
+            },
+        )));
+
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_uri(missing_uri.clone()).unwrap();
+        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![blob_builder.finish().unwrap()]).unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                dataset_path.to_str().unwrap(),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    session: Some(session),
+                    external_blob_mode,
+                    allow_external_blob_outside_bases,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        if external_blob_mode == ExternalBlobMode::Reference {
+            let descriptions = dataset
+                .scan()
+                .project(&["blob"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let stored_uri = descriptions["blob"]
+                .as_struct()
+                .column_by_name("uri")
+                .unwrap()
+                .as_string::<i32>()
+                .value(0);
+            assert_eq!(
+                stored_uri,
+                super::normalize_external_absolute_uri(&missing_uri).unwrap()
+            );
+        }
+
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"resolved"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[rstest]

@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use lance_core::cache::{CacheBackend, LanceCache, QuickCacheBackend};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -20,6 +21,35 @@ use self::index_extension::IndexExtension;
 pub(crate) mod caches;
 pub mod index_caches;
 pub(crate) mod index_extension;
+
+/// Resolves an external blob URI immediately before Lance fetches it.
+///
+/// The resolver is runtime-only: Lance continues to persist the original URI.
+/// Implementations can redirect unstable public URLs to mirrors or local caches,
+/// and can apply custom retry and validation before returning a fetchable URI.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use async_trait::async_trait;
+/// # use lance::session::{ExternalBlobUriResolver, Session};
+/// struct MirrorResolver;
+///
+/// #[async_trait]
+/// impl ExternalBlobUriResolver for MirrorResolver {
+///     async fn resolve_uri(&self, uri: &str) -> lance::Result<String> {
+///         Ok(uri.replace("https://public.example/", "s3://mirror/"))
+///     }
+/// }
+///
+/// let session =
+///     Session::default().with_external_blob_uri_resolver(Arc::new(MirrorResolver));
+/// # let _ = session;
+/// ```
+#[async_trait]
+pub trait ExternalBlobUriResolver: Send + Sync {
+    /// Return the URI Lance should fetch for `uri`.
+    async fn resolve_uri(&self, uri: &str) -> Result<String>;
+}
 
 /// Cache selection for one session cache tier.
 #[derive(Clone, Debug)]
@@ -67,6 +97,8 @@ pub struct Session {
     store_registry: Arc<ObjectStoreRegistry>,
 
     spill_store: Arc<dyn SpillStore>,
+
+    external_blob_uri_resolver: Option<Arc<dyn ExternalBlobUriResolver>>,
 }
 
 impl DeepSizeOf for Session {
@@ -128,6 +160,7 @@ impl Session {
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
+            external_blob_uri_resolver: None,
         }
     }
 
@@ -148,6 +181,7 @@ impl Session {
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
+            external_blob_uri_resolver: None,
         }
     }
 
@@ -219,6 +253,7 @@ impl Session {
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
+            external_blob_uri_resolver: None,
         }
     }
 
@@ -300,6 +335,21 @@ impl Session {
     /// Get the object store registry.
     pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
         self.store_registry.clone()
+    }
+
+    /// Install the resolver used immediately before fetching absolute external blob URIs.
+    ///
+    /// The resolver applies to blob ingest writes and reads that use this session.
+    pub fn with_external_blob_uri_resolver(
+        mut self,
+        resolver: Arc<dyn ExternalBlobUriResolver>,
+    ) -> Self {
+        self.external_blob_uri_resolver = Some(resolver);
+        self
+    }
+
+    pub(crate) fn external_blob_uri_resolver(&self) -> Option<Arc<dyn ExternalBlobUriResolver>> {
+        self.external_blob_uri_resolver.clone()
     }
 
     /// Get a reference to the raw metadata cache (for use in index reconstruction).

@@ -332,6 +332,7 @@ class _Session:
         metadata_cache_size_bytes: Optional[int] = None,
         index_cache_backend: Optional[str | Dict[str, Any]] = None,
         metadata_cache_backend: Optional[str | Dict[str, Any]] = None,
+        external_blob_uri_resolver: Optional[Callable[[str], str]] = None,
     ) -> None:
         """Create a Lance session.
 
@@ -341,6 +342,10 @@ class _Session:
         ``index_cache_backend`` is mutually exclusive with
         ``index_cache_size_bytes``. ``metadata_cache_backend`` is mutually
         exclusive with ``metadata_cache_size_bytes``.
+
+        ``external_blob_uri_resolver`` is called with an absolute external
+        blob URI immediately before Lance fetches it and must return the URI
+        Lance should fetch.
         """
         ...
     def size_bytes(self) -> int: ...

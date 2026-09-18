@@ -4,11 +4,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use pyo3::exceptions::PyValueError;
 use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyString};
-use pyo3::{Bound, PyAny, PyResult, pyclass, pymethods};
+use pyo3::{Bound, Py, PyAny, PyResult, Python, pyclass, pymethods};
 
-use lance::session::{CacheSpec, Session as LanceSession};
+use lance::session::{CacheSpec, ExternalBlobUriResolver, Session as LanceSession};
 use lance_core::cache::{BackendConfig, build_from_config, build_from_uri};
 
 use crate::object_store::PyObjectStoreRegistry;
@@ -32,6 +33,9 @@ use crate::rt;
 /// metadata_cache_backend : str or dict, optional
 ///     Custom metadata cache backend with the same format as
 ///     ``index_cache_backend``.
+/// external_blob_uri_resolver : callable, optional
+///     Called with an absolute external blob URI immediately before Lance
+///     fetches it. It must return the URI Lance should fetch.
 ///
 /// ``index_cache_backend`` is mutually exclusive with
 /// ``index_cache_size_bytes``. ``metadata_cache_backend`` is mutually
@@ -45,6 +49,18 @@ pub struct Session {
 impl Session {
     pub fn new(inner: Arc<LanceSession>) -> Self {
         Self { inner }
+    }
+}
+
+struct PyExternalBlobUriResolver {
+    resolver: Py<PyAny>,
+}
+
+#[async_trait]
+impl ExternalBlobUriResolver for PyExternalBlobUriResolver {
+    async fn resolve_uri(&self, uri: &str) -> lance::Result<String> {
+        Python::attach(|py| self.resolver.call1(py, (uri,))?.extract::<String>(py))
+            .map_err(|error| lance::Error::external(Box::new(error)))
     }
 }
 
@@ -170,6 +186,7 @@ impl Session {
         index_cache_backend=None,
         metadata_cache_backend=None,
         store_registry=None,
+        external_blob_uri_resolver=None,
     ))]
     fn create(
         index_cache_size_bytes: Option<usize>,
@@ -177,6 +194,7 @@ impl Session {
         index_cache_backend: Option<Bound<'_, PyAny>>,
         metadata_cache_backend: Option<Bound<'_, PyAny>>,
         store_registry: Option<PyObjectStoreRegistry>,
+        external_blob_uri_resolver: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let index_cache = resolve_cache_spec(
             "index_cache_backend",
@@ -191,8 +209,19 @@ impl Session {
             metadata_cache_size_bytes,
         )?;
         let store_registry = store_registry.map(|r| r.inner).unwrap_or_default();
-        let session =
+        let mut session =
             LanceSession::with_cache_backends(index_cache, metadata_cache, store_registry);
+        if let Some(resolver) = external_blob_uri_resolver {
+            if !resolver.is_callable() {
+                return Err(PyValueError::new_err(
+                    "external_blob_uri_resolver must be callable",
+                ));
+            }
+            session =
+                session.with_external_blob_uri_resolver(Arc::new(PyExternalBlobUriResolver {
+                    resolver: resolver.unbind(),
+                }));
+        }
         Ok(Self {
             inner: Arc::new(session),
         })
