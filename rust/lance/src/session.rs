@@ -4,12 +4,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use lance_core::cache::{CacheBackend, LanceCache, QuickCacheBackend};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::spill::{LocalSpillStore, SpillStore};
+use lance_io::traits::Reader;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::session::caches::GlobalMetadataCache;
@@ -20,6 +22,44 @@ use self::index_extension::IndexExtension;
 pub(crate) mod caches;
 pub mod index_caches;
 pub(crate) mod index_extension;
+
+/// Fetches an absolute external blob URI.
+///
+/// The fetcher is runtime-only: Lance continues to persist the original URI.
+/// Implementations can apply custom authentication, retries, mirrors, validation,
+/// or caching and return a random-access reader over the fetched object.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use async_trait::async_trait;
+/// # use lance::session::{ExternalBlobFetcher, Session};
+/// # use lance_io::object_store::ObjectStore;
+/// # use lance_io::traits::Reader;
+/// # use object_store::path::Path;
+/// struct LocalFetcher {
+///     store: ObjectStore,
+///     path: Path,
+/// }
+///
+/// #[async_trait]
+/// impl ExternalBlobFetcher for LocalFetcher {
+///     async fn fetch(&self, _uri: &str) -> lance::Result<Box<dyn Reader>> {
+///         self.store.open(&self.path).await
+///     }
+/// }
+///
+/// let fetcher = LocalFetcher {
+///     store: ObjectStore::local(),
+///     path: Path::from("mirror/blob.bin"),
+/// };
+/// let session = Session::default().with_external_blob_fetcher(Arc::new(fetcher));
+/// # let _ = session;
+/// ```
+#[async_trait]
+pub trait ExternalBlobFetcher: Send + Sync {
+    /// Fetch `uri` and return a reader over its bytes.
+    async fn fetch(&self, uri: &str) -> Result<Box<dyn Reader>>;
+}
 
 /// Cache selection for one session cache tier.
 #[derive(Clone, Debug)]
@@ -67,6 +107,8 @@ pub struct Session {
     store_registry: Arc<ObjectStoreRegistry>,
 
     spill_store: Arc<dyn SpillStore>,
+
+    external_blob_fetcher: Option<Arc<dyn ExternalBlobFetcher>>,
 }
 
 impl DeepSizeOf for Session {
@@ -128,6 +170,7 @@ impl Session {
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
+            external_blob_fetcher: None,
         }
     }
 
@@ -148,6 +191,7 @@ impl Session {
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
+            external_blob_fetcher: None,
         }
     }
 
@@ -219,6 +263,7 @@ impl Session {
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
+            external_blob_fetcher: None,
         }
     }
 
@@ -300,6 +345,19 @@ impl Session {
     /// Get the object store registry.
     pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
         self.store_registry.clone()
+    }
+
+    /// Install the fetcher used for absolute external blob URIs.
+    ///
+    /// The fetcher applies to blob ingest writes and reads that use this session.
+    /// Without one, Lance fetches external blobs through its object-store registry.
+    pub fn with_external_blob_fetcher(mut self, fetcher: Arc<dyn ExternalBlobFetcher>) -> Self {
+        self.external_blob_fetcher = Some(fetcher);
+        self
+    }
+
+    pub(crate) fn external_blob_fetcher(&self) -> Option<Arc<dyn ExternalBlobFetcher>> {
+        self.external_blob_fetcher.clone()
     }
 
     /// Get a reference to the raw metadata cache (for use in index reconstruction).

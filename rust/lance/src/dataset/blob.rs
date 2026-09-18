@@ -42,6 +42,7 @@ use crate::blob::{
     BlobDescriptor, BlobDescriptorArrayBuilder, BlobIdAllocator, BlobRange, PackedBlobWriter,
     blob_v2_layout, blob_v2_shape_error, validate_prepared_blob_array,
 };
+use crate::session::ExternalBlobFetcher;
 use arrow_array::StructArray;
 use lance_core::datatypes::{
     BLOB_DESC_FIELDS, BlobKind, BlobV2Layout, BlobVersion, Field as LanceField, Schema,
@@ -455,6 +456,7 @@ pub struct BlobPreprocessor {
     external_blob_mode: ExternalBlobMode,
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
+    external_blob_fetcher: Option<Arc<dyn ExternalBlobFetcher>>,
 }
 
 /// A logical slice of an external blob that can be materialized or streamed into Lance-managed
@@ -664,7 +666,16 @@ impl BlobPreprocessor {
             external_blob_mode,
             source_store_registry,
             source_store_params,
+            external_blob_fetcher: None,
         })
+    }
+
+    pub(super) fn with_external_blob_fetcher(
+        mut self,
+        fetcher: Option<Arc<dyn ExternalBlobFetcher>>,
+    ) -> Self {
+        self.external_blob_fetcher = fetcher;
+        self
     }
 
     pub(super) fn with_part_blob_ids(mut self, blob_ids: Range<u32>) -> Result<Self> {
@@ -850,13 +861,17 @@ impl BlobPreprocessor {
         position: Option<u64>,
         size: Option<u64>,
     ) -> Result<ExternalBlobSource> {
-        let (object_store, path) = ObjectStore::from_uri_and_params(
-            self.source_store_registry.clone(),
-            uri,
-            &self.source_store_params,
-        )
-        .await?;
-        let reader = object_store.open(&path).await?;
+        let reader = if let Some(fetcher) = &self.external_blob_fetcher {
+            fetcher.fetch(uri).await?
+        } else {
+            let (object_store, path) = ObjectStore::from_uri_and_params(
+                self.source_store_registry.clone(),
+                uri,
+                &self.source_store_params,
+            )
+            .await?;
+            object_store.open(&path).await?
+        };
         match (position, size) {
             (Some(position), Some(size)) => {
                 position.checked_add(size).ok_or_else(|| {
@@ -1340,6 +1355,7 @@ pub async fn preprocess_blob_batches(
 struct BlobSource {
     object_store: Arc<ObjectStore>,
     path: Path,
+    reader: Option<Arc<dyn Reader>>,
     scheduler: OnceCell<FileScheduler>,
     pending_reads: Mutex<PendingBlobReads>,
     /// Calls to [`BlobSource::read_ranges`]. Shared by every handle on this
@@ -1353,6 +1369,19 @@ impl BlobSource {
         Self {
             object_store,
             path,
+            reader: None,
+            scheduler: OnceCell::new(),
+            pending_reads: Mutex::new(PendingBlobReads::default()),
+            range_submissions: AtomicUsize::new(0),
+        }
+    }
+
+    /// Create a read context backed by a reader supplied by an external blob fetcher.
+    fn from_reader(reader: Box<dyn Reader>, scheduler_store: Arc<ObjectStore>) -> Self {
+        Self {
+            path: reader.path().clone(),
+            object_store: scheduler_store,
+            reader: Some(reader.into()),
             scheduler: OnceCell::new(),
             pending_reads: Mutex::new(PendingBlobReads::default()),
             range_submissions: AtomicUsize::new(0),
@@ -1374,12 +1403,15 @@ impl BlobSource {
         let scheduler = self
             .scheduler
             .get_or_try_init(|| async {
-                let reader = self.object_store.open(&self.path).await?;
+                let reader = match &self.reader {
+                    Some(reader) => reader.clone(),
+                    None => self.object_store.open(&self.path).await?.into(),
+                };
                 let scheduler = ScanScheduler::new(
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(self.object_store.as_ref()),
                 );
-                Ok::<_, Error>(scheduler.open_reader(reader.into()))
+                Ok::<_, Error>(scheduler.open_reader(reader))
             })
             .await?;
 
@@ -4535,6 +4567,27 @@ impl<'a> BlobV2ReadContext<'a> {
         let position = columns.positions.value(idx);
         let size = columns.sizes.value(idx);
         let base_id = columns.blob_ids.value(idx);
+        if base_id == 0
+            && let Some(fetcher) = self.dataset.session.external_blob_fetcher()
+        {
+            let reader = fetcher.fetch(&uri_or_path).await?;
+            let size = if size > 0 {
+                size
+            } else {
+                reader.size().await? as u64
+            };
+            let source = Arc::new(BlobSource::from_reader(
+                reader,
+                self.dataset.object_store.clone(),
+            ));
+            return Ok(BlobFile::with_source(
+                source,
+                position,
+                size,
+                BlobKind::External,
+                Some(uri_or_path),
+            ));
+        }
         let (object_store, path) = if base_id == 0 {
             let registry = self.dataset.session.store_registry();
             let params = self
@@ -4707,6 +4760,7 @@ mod tests {
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
     };
     use lance_io::stream::RecordBatchStream;
+    use lance_io::traits::Reader;
     use lance_table::format::BasePath;
     use object_store::{
         Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
@@ -4743,6 +4797,7 @@ mod tests {
             scanner::MaterializationStyle,
             transaction::{DataReplacementGroup, Operation, Transaction},
         },
+        session::{ExternalBlobFetcher, Session},
         utils::test::TestDatasetGenerator,
     };
 
@@ -4756,6 +4811,20 @@ mod tests {
         _test_dir: TempDir,
         dataset: Arc<Dataset>,
         expected: Vec<u8>,
+    }
+
+    struct FixedExternalBlobFetcher {
+        store: Arc<ObjectStore>,
+        path: Path,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ExternalBlobFetcher for FixedExternalBlobFetcher {
+        async fn fetch(&self, _uri: &str) -> Result<Box<dyn Reader>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.store.open(&self.path).await
+        }
     }
 
     #[test]
@@ -8326,6 +8395,88 @@ mod tests {
             blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"outside"
         );
+    }
+
+    #[rstest]
+    #[case::ingest(ExternalBlobMode::Ingest, false)]
+    #[case::reference(ExternalBlobMode::Reference, true)]
+    #[tokio::test]
+    async fn test_external_blob_fetcher(
+        #[case] external_blob_mode: ExternalBlobMode,
+        #[case] allow_external_blob_outside_bases: bool,
+    ) {
+        let test_dir = TempDir::default();
+        let dataset_path = test_dir.std_path().join("dataset");
+        let resolved_path = test_dir.std_path().join("resolved.bin");
+        std::fs::write(&resolved_path, b"resolved").unwrap();
+        let resolved_uri = format!("file://{}", resolved_path.display());
+        let (fetched_store, fetched_path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            &resolved_uri,
+            &ObjectStoreParams::default(),
+        )
+        .await
+        .unwrap();
+        let missing_uri = format!(
+            "file://{}",
+            test_dir.std_path().join("missing.bin").display()
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = Arc::new(Session::default().with_external_blob_fetcher(Arc::new(
+            FixedExternalBlobFetcher {
+                store: fetched_store,
+                path: fetched_path,
+                calls: calls.clone(),
+            },
+        )));
+
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_uri(missing_uri.clone()).unwrap();
+        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![blob_builder.finish().unwrap()]).unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                dataset_path.to_str().unwrap(),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    session: Some(session),
+                    external_blob_mode,
+                    allow_external_blob_outside_bases,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        if external_blob_mode == ExternalBlobMode::Reference {
+            let descriptions = dataset
+                .scan()
+                .project(&["blob"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let stored_uri = descriptions["blob"]
+                .as_struct()
+                .column_by_name("blob_uri")
+                .unwrap()
+                .as_string::<i32>()
+                .value(0);
+            assert_eq!(
+                stored_uri,
+                super::normalize_external_absolute_uri(&missing_uri).unwrap()
+            );
+        }
+
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"resolved"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[rstest]

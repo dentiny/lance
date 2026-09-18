@@ -16,6 +16,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import (
     Any,
+    BinaryIO,
     Callable,
     Dict,
     Iterable,
@@ -332,6 +333,7 @@ class _Session:
         metadata_cache_size_bytes: Optional[int] = None,
         index_cache_backend: Optional[str | Dict[str, Any]] = None,
         metadata_cache_backend: Optional[str | Dict[str, Any]] = None,
+        external_blob_fetcher: Optional[Callable[[str], BinaryIO]] = None,
     ) -> None:
         """Create a Lance session.
 
@@ -341,6 +343,10 @@ class _Session:
         ``index_cache_backend`` is mutually exclusive with
         ``index_cache_size_bytes``. ``metadata_cache_backend`` is mutually
         exclusive with ``metadata_cache_size_bytes``.
+
+        ``external_blob_fetcher`` is called with an absolute external blob URI
+        and must return a seekable binary file-like object. Lance reads that
+        object directly.
         """
         ...
     def size_bytes(self) -> int: ...

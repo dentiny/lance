@@ -1781,6 +1781,34 @@ def test_blob_extension_write_external_ingest(tmp_path):
         assert f.read() == b"hello"
 
 
+@pytest.mark.parametrize("external_blob_mode", ["ingest", "reference"])
+def test_blob_extension_external_fetcher(tmp_path, external_blob_mode):
+    blob_path = tmp_path / "external_blob.bin"
+    blob_path.write_bytes(b"hello")
+    missing_uri = (tmp_path / "missing.bin").as_uri()
+    fetched_uris = []
+
+    def fetch(uri):
+        fetched_uris.append(uri)
+        return blob_path.open("rb")
+
+    table = pa.table({"blob": lance.blob_array([missing_uri])})
+    ds = lance.write_dataset(
+        table,
+        tmp_path / f"test_ds_v2_external_{external_blob_mode}_fetcher",
+        data_storage_version="2.2",
+        external_blob_mode=external_blob_mode,
+        allow_external_blob_outside_bases=external_blob_mode == "reference",
+        session=lance.Session(external_blob_fetcher=fetch),
+    )
+
+    expected_before_read = [missing_uri] if external_blob_mode == "ingest" else []
+    assert fetched_uris == expected_before_read
+    with ds.take_blobs("blob", indices=[0])[0] as blob:
+        assert blob.read() == b"hello"
+    assert fetched_uris == [missing_uri]
+
+
 def test_blob_extension_write_external_ingest_rejects_reference_only_options(tmp_path):
     blob_path = tmp_path / "external_blob.bin"
     blob_path.write_bytes(b"hello")
