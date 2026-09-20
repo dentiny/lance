@@ -81,6 +81,11 @@ def test_cache_backend_uri_config():
     assert session.index_cache_size_bytes() == 0
 
 
+def test_external_blob_fetcher_must_be_callable():
+    with pytest.raises(ValueError, match="must be callable"):
+        lance.Session(external_blob_fetcher="not callable")
+
+
 def test_cache_backend_dict_config():
     session = lance.Session(
         index_cache_backend={

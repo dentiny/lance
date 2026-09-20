@@ -2,14 +2,22 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
+use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
-use pyo3::exceptions::PyValueError;
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::{StreamExt, future::BoxFuture};
+use object_store::{Error as ObjectStoreError, path::Path};
+use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyString};
-use pyo3::{Bound, PyAny, PyResult, pyclass, pymethods};
+use pyo3::{Bound, Py, PyAny, PyErr, PyResult, Python, pyclass, pymethods};
 
-use lance::session::{CacheSpec, Session as LanceSession};
+use lance::session::{CacheSpec, ExternalBlobFetcher, Session as LanceSession};
 use lance_core::cache::{BackendConfig, build_from_config, build_from_uri};
+use lance_core::deepsize::{Context, DeepSizeOf};
+use lance_io::traits::{ByteStream, Reader};
 
 use crate::object_store::PyObjectStoreRegistry;
 use crate::rt;
@@ -32,6 +40,9 @@ use crate::rt;
 /// metadata_cache_backend : str or dict, optional
 ///     Custom metadata cache backend with the same format as
 ///     ``index_cache_backend``.
+/// external_blob_fetcher : callable, optional
+///     Called with an absolute external blob URI and must return a seekable
+///     binary file-like object. Lance reads the returned object directly.
 ///
 /// ``index_cache_backend`` is mutually exclusive with
 /// ``index_cache_size_bytes``. ``metadata_cache_backend`` is mutually
@@ -45,6 +56,135 @@ pub struct Session {
 impl Session {
     pub fn new(inner: Arc<LanceSession>) -> Self {
         Self { inner }
+    }
+}
+
+struct PyExternalBlobFetcher {
+    fetcher: Py<PyAny>,
+}
+
+#[async_trait]
+impl ExternalBlobFetcher for PyExternalBlobFetcher {
+    async fn fetch(&self, uri: &str) -> lance::Result<Box<dyn Reader>> {
+        let reader = Python::attach(|py| self.fetcher.call1(py, (uri,)))
+            .map_err(|error| lance::Error::external(Box::new(error)))?;
+        Ok(Box::new(PyExternalBlobReader {
+            reader: Arc::new(reader),
+            path: Path::from(uri),
+        }))
+    }
+}
+
+struct PyExternalBlobReader {
+    reader: Arc<Py<PyAny>>,
+    path: Path,
+}
+
+impl fmt::Debug for PyExternalBlobReader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PyExternalBlobReader")
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+impl DeepSizeOf for PyExternalBlobReader {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        0
+    }
+}
+
+fn object_store_error(error: PyErr) -> ObjectStoreError {
+    ObjectStoreError::Generic {
+        store: "python external blob fetcher",
+        source: Box::new(error),
+    }
+}
+
+fn read_python_range(reader: &Py<PyAny>, range: Range<usize>) -> object_store::Result<Bytes> {
+    Python::attach(|py| {
+        reader.call_method1(py, "seek", (range.start, 0))?;
+        let data: Vec<u8> = reader
+            .call_method1(py, "read", (range.len(),))?
+            .extract(py)?;
+        if data.len() != range.len() {
+            return Err(PyIOError::new_err(format!(
+                "external blob reader returned {} bytes for range {}..{}; expected {}",
+                data.len(),
+                range.start,
+                range.end,
+                range.len()
+            )));
+        }
+        Ok(Bytes::from(data))
+    })
+    .map_err(object_store_error)
+}
+
+fn python_range_stream(reader: Arc<Py<PyAny>>, range: Range<usize>) -> ByteStream {
+    const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+    let range_end = range.end;
+
+    futures::stream::try_unfold((reader, range.start), move |(reader, start)| async move {
+        if start >= range_end {
+            return Ok(None);
+        }
+        let end = start.saturating_add(CHUNK_SIZE).min(range_end);
+        let bytes = read_python_range(reader.as_ref(), start..end)?;
+        Ok(Some((bytes, (reader, end))))
+    })
+    .boxed()
+}
+
+impl Reader for PyExternalBlobReader {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn block_size(&self) -> usize {
+        8 * 1024 * 1024
+    }
+
+    fn io_parallelism(&self) -> usize {
+        1
+    }
+
+    fn size(&self) -> BoxFuture<'_, object_store::Result<usize>> {
+        Box::pin(async move {
+            Python::attach(|py| {
+                let current: usize = self.reader.call_method0(py, "tell")?.extract(py)?;
+                self.reader.call_method1(py, "seek", (0, 2))?;
+                let size = self.reader.call_method0(py, "tell")?.extract(py)?;
+                self.reader.call_method1(py, "seek", (current, 0))?;
+                Ok(size)
+            })
+            .map_err(object_store_error)
+        })
+    }
+
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>> {
+        let reader = self.reader.clone();
+        Box::pin(async move { read_python_range(reader.as_ref(), range) })
+    }
+
+    fn get_all(&self) -> BoxFuture<'_, object_store::Result<Bytes>> {
+        Box::pin(async move {
+            Python::attach(|py| {
+                self.reader.call_method1(py, "seek", (0, 0))?;
+                let data: Vec<u8> = self.reader.call_method0(py, "read")?.extract(py)?;
+                Ok(Bytes::from(data))
+            })
+            .map_err(object_store_error)
+        })
+    }
+
+    fn get_range_stream(
+        &self,
+        range: Range<usize>,
+    ) -> BoxFuture<'_, object_store::Result<ByteStream>> {
+        let reader = self.reader.clone();
+        Box::pin(async move { Ok(python_range_stream(reader, range)) })
     }
 }
 
@@ -170,6 +310,7 @@ impl Session {
         index_cache_backend=None,
         metadata_cache_backend=None,
         store_registry=None,
+        external_blob_fetcher=None,
     ))]
     fn create(
         index_cache_size_bytes: Option<usize>,
@@ -177,6 +318,7 @@ impl Session {
         index_cache_backend: Option<Bound<'_, PyAny>>,
         metadata_cache_backend: Option<Bound<'_, PyAny>>,
         store_registry: Option<PyObjectStoreRegistry>,
+        external_blob_fetcher: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let index_cache = resolve_cache_spec(
             "index_cache_backend",
@@ -191,8 +333,18 @@ impl Session {
             metadata_cache_size_bytes,
         )?;
         let store_registry = store_registry.map(|r| r.inner).unwrap_or_default();
-        let session =
+        let mut session =
             LanceSession::with_cache_backends(index_cache, metadata_cache, store_registry);
+        if let Some(fetcher) = external_blob_fetcher {
+            if !fetcher.is_callable() {
+                return Err(PyValueError::new_err(
+                    "external_blob_fetcher must be callable",
+                ));
+            }
+            session = session.with_external_blob_fetcher(Arc::new(PyExternalBlobFetcher {
+                fetcher: fetcher.unbind(),
+            }));
+        }
         Ok(Self {
             inner: Arc::new(session),
         })
