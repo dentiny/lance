@@ -2683,9 +2683,8 @@ mod tests {
         use lance_datafusion::exec::LanceExecutionOptions;
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![ROW_ID_FIELD.clone()]));
-        // ~8 MB of candidates against a 2 MB pool: the sorts must spill.
-        // DataFusion 56 accounts merge buffers against this pool too; 2K-row
-        // output batches leave room for both sort merges without raising the limit.
+        // ~8 MB of candidates against a 2 MB pool: the sorts must spill,
+        // and the pool still clears DataFusion's fixed merge reservations.
         let candidate_ids: Vec<u64> = (0..1_000_000).collect();
         let live_ids: Vec<u64> = (0..1_000_000).filter(|id| id % 3 == 0).collect();
         let expected = candidate_ids.len() - live_ids.len();
@@ -2711,7 +2710,6 @@ mod tests {
             LanceExecutionOptions {
                 use_spilling: true,
                 mem_pool_size: Some(2 * 1024 * 1024),
-                batch_size: Some(2048),
                 ..Default::default()
             },
         )

@@ -977,16 +977,15 @@ mod tests {
         let input_stats = StatisticsContext::new()
             .compute(input.as_ref(), &StatisticsArgs::new())
             .unwrap();
-        // The int32 and nullable row id occupy 12.125 bytes per row, below the
-        // 32-byte planning floor.
+        // 30 rows of a non-null int32 plus the nullable row id: 12.125 bytes a row.
         assert_eq!(input_stats.num_rows, Precision::Exact(30));
-        assert_eq!(input_stats.total_byte_size, Precision::Inexact(30 * 32));
+        assert_eq!(input_stats.total_byte_size, Precision::Inexact(364));
 
-        // Add both columns so the width exceeds the planning floor and the
-        // float's four bytes remain observable: 12.125 + 68 + 4 = 84.125.
+        // The take passes the row count through and bills the column it adds on top
+        // of the key its input reads: four more bytes a row of float32.
         let widened = dataset
             .empty_projection()
-            .union_columns(["f", "s"], OnMissing::Error)
+            .union_column("f", OnMissing::Error)
             .unwrap();
         let take_exec = TakeExec::try_new(dataset.clone(), input.clone(), widened)
             .unwrap()
@@ -995,7 +994,7 @@ mod tests {
             .compute(&take_exec, &StatisticsArgs::new())
             .unwrap();
         assert_eq!(stats.num_rows, input_stats.num_rows);
-        assert_eq!(stats.total_byte_size, Precision::Inexact(2524));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(484));
         // A variable-width column is seeded from the decoder's estimate rather than
         // withdrawing the row: 64 bytes of string and a 4-byte offset on top.
         let seeded = dataset

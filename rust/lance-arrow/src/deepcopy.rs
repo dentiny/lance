@@ -200,8 +200,10 @@ mod tests {
 
     #[test]
     fn raw_parent_offset_struct_of_fixed_size_list_reaches_the_right_values() {
-        // A struct window held as the parent offset over whole children, with
-        // a fixed-size-list child. Both extenders must apply their offsets once.
+        // A struct window held as the parent offset over whole children (the
+        // shape `StructArray::from` reads), with a fixed-size-list child: the
+        // struct extender forwards the absolute index, and the list scales it
+        // by its size into its own whole values.
         let values = Int32Array::from(vec![10, 11, 20, 21, 30, 31]).to_data();
         let item = Arc::new(Field::new_list_field(DataType::Int32, false));
         let list = ArrayDataBuilder::new(DataType::FixedSizeList(item, 2))
@@ -225,7 +227,8 @@ mod tests {
     #[test]
     fn raw_parent_offset_struct_keeps_the_selected_child_row() {
         // A struct whose children are whole and whose window is the parent
-        // offset: Arrow applies that offset before extending its children.
+        // offset: arrow's struct extender forwards the index to those children
+        // untouched, so it has to be the absolute one.
         let field = Arc::new(Field::new("a", DataType::Int32, false));
         let data = ArrayDataBuilder::new(DataType::Struct(vec![field].into()))
             .len(1)

@@ -336,13 +336,7 @@ mod tests {
         let batch = record_batch!(("x", Int32, (0..128).rev().collect::<Vec<i32>>())).unwrap();
         let input = OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
             batch.schema(),
-            // Own each buffer so DataFusion 56's shared-buffer accounting still
-            // sees the intended spill pressure instead of one repeatedly borrowed batch.
-            futures::stream::iter(
-                (0..128)
-                    .map(|_| Ok(lance_arrow::deepcopy::deep_copy_batch(&batch).unwrap()))
-                    .collect::<Vec<_>>(),
-            ),
+            futures::stream::iter((0..128).map(|_| Ok(batch.clone())).collect::<Vec<_>>()),
         )));
         let ordering = LexOrdering::new([PhysicalSortExpr::new_default(
             col("x", &batch.schema()).unwrap(),
