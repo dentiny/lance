@@ -1210,7 +1210,7 @@ pub(super) async fn alter_columns(
                     .iter()
                     .filter(|(key, _)| KEY_METADATA.contains(&key.as_str()))
                     .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
+                    .collect::<arrow_schema::Metadata>(),
             );
             *field_dest = Field::try_from(&arrow_field)?;
             field_dest.try_set_id(field_src.parent_id, &mut next_field_id)?;
@@ -7575,13 +7575,10 @@ mod test {
     /// reached the same state without passing that check.
     #[tokio::test]
     async fn test_alter_columns_cannot_make_a_primary_key_nullable() -> Result<()> {
-        let pk = ArrowField::new("id", DataType::Int32, false).with_metadata(
-            [(
-                "lance-schema:unenforced-primary-key:position".to_string(),
-                "1".to_string(),
-            )]
-            .into(),
-        );
+        let pk = ArrowField::new("id", DataType::Int32, false).with_metadata([(
+            "lance-schema:unenforced-primary-key:position".to_string(),
+            "1".to_string(),
+        )]);
         let schema = Arc::new(ArrowSchema::new(vec![
             pk,
             ArrowField::new("value", DataType::Int32, true),

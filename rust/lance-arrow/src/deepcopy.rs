@@ -97,21 +97,11 @@ pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
     // Use MutableArrayData to efficiently copy just the slice
     let mut mutable = MutableArrayData::new(vec![data], false, data.len());
 
-    // Which index this takes depends on the layout, because arrow's extenders
-    // disagree about who applies `ArrayData::offset()`. The boolean and
-    // fixed-size-list ones add it themselves (the latter since arrow 59.3.2),
-    // so an offset-applied index there reads from twice the offset and runs
-    // off the end of the buffer. Every other layout either reads through an
-    // already-offset-applied view or, like struct, forwards the index to
-    // children that do not carry the parent's offset, and takes the absolute
-    // index.
-    let start = match data.data_type() {
-        DataType::Boolean | DataType::FixedSizeList(..) => 0,
-        _ => data.offset(),
-    };
-    // The copy holds no more data than the valid source array, so offsets cannot overflow.
+    // Arrow 60 applies each source array's offset inside its extenders,
+    // including struct and sparse-union parents. Indices are relative to the
+    // logical slice; adding the parent offset here would apply it twice.
     mutable
-        .try_extend(0, start, start + data.len())
+        .try_extend(0, 0, data.len())
         .expect("copying a slice of a valid array cannot overflow its offsets");
 
     // Freeze into immutable ArrayData

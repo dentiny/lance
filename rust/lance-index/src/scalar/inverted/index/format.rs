@@ -3,6 +3,28 @@
 
 use super::*;
 
+// Index readers retain HashMap metadata, while Arrow batches use Metadata.
+// Borrow both representations without allocating a map for every posting batch.
+pub(in super::super) trait MetadataLookup {
+    fn get(&self, key: &str) -> Option<&String>;
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+}
+
+impl MetadataLookup for HashMap<String, String> {
+    fn get(&self, key: &str) -> Option<&String> {
+        Self::get(self, key)
+    }
+}
+
+impl MetadataLookup for arrow_schema::Metadata {
+    fn get(&self, key: &str) -> Option<&String> {
+        Self::get(self, key)
+    }
+}
+
 // Version 0: Arrow TokenSetFormat (legacy)
 // Version 1: Fst TokenSetFormat with per-doc compressed positions
 // Version 2: Fst TokenSetFormat with shared posting-list position streams.
@@ -300,7 +322,7 @@ impl PostingTailCodec {
 }
 
 pub(in super::super) fn parse_posting_tail_codec(
-    metadata: &HashMap<String, String>,
+    metadata: &impl MetadataLookup,
 ) -> Result<PostingTailCodec> {
     Ok(metadata
         .get(POSTING_TAIL_CODEC_KEY)
@@ -309,9 +331,7 @@ pub(in super::super) fn parse_posting_tail_codec(
         .unwrap_or(PostingTailCodec::Fixed32))
 }
 
-pub(in super::super) fn parse_posting_block_size(
-    metadata: &HashMap<String, String>,
-) -> Result<usize> {
+pub(in super::super) fn parse_posting_block_size(metadata: &impl MetadataLookup) -> Result<usize> {
     metadata
         .get(POSTING_BLOCK_SIZE_KEY)
         .map(|value| {
@@ -347,7 +367,7 @@ impl PositionStreamCodec {
 }
 
 pub(super) fn parse_shared_position_codec(
-    metadata: &HashMap<String, String>,
+    metadata: &impl MetadataLookup,
 ) -> Result<PositionStreamCodec> {
     if let Some(codec) = metadata.get(POSITIONS_CODEC_KEY) {
         return PositionStreamCodec::from_metadata_value(codec);
@@ -363,7 +383,7 @@ pub(super) fn parse_shared_position_codec(
 }
 
 pub(in super::super) fn parse_format_version_from_metadata(
-    metadata: &HashMap<String, String>,
+    metadata: &impl MetadataLookup,
 ) -> Result<InvertedListFormatVersion> {
     if let Some(value) = metadata.get(FTS_FORMAT_VERSION_KEY) {
         let format_version = InvertedListFormatVersion::from_str(value)?;
